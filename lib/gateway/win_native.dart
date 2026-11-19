@@ -51,8 +51,87 @@ void winRequestCloseApp() {
 
 // ---------------- Seriell ----------------
 
-/// Vorhandene COM-Ports (COM1..COM64)
+/// Vorhandene COM-Ports laut Windows (HKLM\HARDWARE\DEVICEMAP\SERIALCOMM).
+/// Die Ports werden dabei NICHT geoeffnet: Das Probe-Oeffnen von COM1..COM64
+/// hing bei Bluetooth-COM-Ports sekundenlang (Oberflaeche und Ton standen)
+/// und stoerte Ports, die gerade ein anderes Programm nutzt.
 List<String> winListComPorts() {
+  try {
+    final fromRegistry = _comPortsFromRegistry();
+    if (fromRegistry != null) return fromRegistry;
+  } catch (_) {}
+  return _comPortsByProbing();
+}
+
+List<String>? _comPortsFromRegistry() {
+  final adv = DynamicLibrary.open('advapi32.dll');
+  final regOpenKeyEx = adv.lookupFunction<
+      Int32 Function(IntPtr, Pointer<Utf16>, Uint32, Uint32, Pointer<IntPtr>),
+      int Function(int, Pointer<Utf16>, int, int, Pointer<IntPtr>)>('RegOpenKeyExW');
+  final regEnumValue = adv.lookupFunction<
+      Int32 Function(IntPtr, Uint32, Pointer<Utf16>, Pointer<Uint32>, Pointer<Uint32>,
+          Pointer<Uint32>, Pointer<Uint8>, Pointer<Uint32>),
+      int Function(int, int, Pointer<Utf16>, Pointer<Uint32>, Pointer<Uint32>,
+          Pointer<Uint32>, Pointer<Uint8>, Pointer<Uint32>)>('RegEnumValueW');
+  final regCloseKey =
+      adv.lookupFunction<Int32 Function(IntPtr), int Function(int)>('RegCloseKey');
+
+  const hkeyLocalMachine = -2147483646; // (HKEY)0x80000002, vorzeichenerweitert
+  const keyRead = 0x20019;
+  const regSz = 1;
+  const nameChars = 256;
+  const dataBytes = 512;
+
+  final subKey = r'HARDWARE\DEVICEMAP\SERIALCOMM'.toNativeUtf16();
+  final hKey = calloc<IntPtr>();
+  final name = calloc<Uint16>(nameChars).cast<Utf16>();
+  final nameLen = calloc<Uint32>();
+  final type = calloc<Uint32>();
+  final data = calloc<Uint8>(dataBytes);
+  final dataLen = calloc<Uint32>();
+  try {
+    final rc = regOpenKeyEx(hkeyLocalMachine, subKey, 0, keyRead, hKey);
+    if (rc == 2) return <String>[]; // Schluessel fehlt = keine COM-Ports
+    if (rc != 0) return null;
+    final ports = <String>{};
+    try {
+      for (var i = 0; i < 256; i++) {
+        nameLen.value = nameChars;
+        dataLen.value = dataBytes - 2;
+        final r = regEnumValue(hKey.value, i, name, nameLen, nullptr, type, data, dataLen);
+        if (r == 259) break; // ERROR_NO_MORE_ITEMS
+        if (r != 0 || type.value != regSz) continue;
+        final chars = dataLen.value ~/ 2;
+        final port = String.fromCharCodes(
+          data.cast<Uint16>().asTypedList(chars).takeWhile((c) => c != 0),
+        ).trim();
+        if (port.isNotEmpty) ports.add(port);
+      }
+    } finally {
+      regCloseKey(hKey.value);
+    }
+    final list = ports.toList()..sort(_comCompare);
+    return list;
+  } finally {
+    calloc.free(subKey);
+    calloc.free(hKey);
+    calloc.free(name);
+    calloc.free(nameLen);
+    calloc.free(type);
+    calloc.free(data);
+    calloc.free(dataLen);
+  }
+}
+
+int _comCompare(String a, String b) {
+  final na = int.tryParse(a.replaceAll(RegExp(r'[^0-9]'), ''));
+  final nb = int.tryParse(b.replaceAll(RegExp(r'[^0-9]'), ''));
+  if (na != null && nb != null && na != nb) return na.compareTo(nb);
+  return a.compareTo(b);
+}
+
+/// Notloesung, falls die Registry nicht lesbar ist.
+List<String> _comPortsByProbing() {
   final out = <String>[];
   for (var n = 1; n <= 64; n++) {
     final h = _openFile('\\\\.\\COM$n', 0xC0000000, 0);

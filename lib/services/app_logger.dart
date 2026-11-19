@@ -3,7 +3,7 @@ import 'package:flutter/foundation.dart';
 import '../config/app_config.dart';
 
 /// Robustes Datei-Logging in `cb_funk_debug.log`.
-/// Liegt direkt im Installationsverzeichnis der App und schreibt
+/// Liegt unter Windows in %LOCALAPPDATA%\CB-Funk und schreibt
 /// jede Zeile sofort synchron per flush() auf Festplatte.
 class AppLogger {
   AppLogger._();
@@ -14,33 +14,49 @@ class AppLogger {
 
   static String get logFilePath => _logPath ?? '';
 
+  /// Ab dieser Groesse wird das Log beim Start nach *.old verschoben.
+  static const int _maxLogBytes = 5 * 1024 * 1024;
+
+  /// Moegliche Ablageorte, der erste beschreibbare gewinnt.
+  /// Windows: %LOCALAPPDATA%\CB-Funk (immer beschreibbar, auch ohne
+  /// Administratorrechte; das Programmverzeichnis unter "Programme" ist es
+  /// fuer normale Benutzer nicht).
+  static List<String> _candidateDirs() {
+    final sep = Platform.pathSeparator;
+    final dirs = <String>[];
+    if (Platform.isWindows) {
+      final local = Platform.environment['LOCALAPPDATA'];
+      if (local != null && local.isNotEmpty) dirs.add('$local${sep}CB-Funk');
+      dirs.add(File(Platform.resolvedExecutable).parent.path);
+    } else {
+      dirs.add(Directory.current.path);
+    }
+    dirs.add(Directory.systemTemp.path);
+    return dirs;
+  }
+
   static void init() {
     if (_initialized) return;
     try {
-      String dir;
-      if (Platform.isWindows) {
-        dir = File(Platform.resolvedExecutable).parent.path;
-      } else {
-        dir = Directory.current.path;
+      for (final dir in _candidateDirs()) {
+        try {
+          Directory(dir).createSync(recursive: true);
+          final path = '$dir${Platform.pathSeparator}cb_funk_debug.log';
+          final file = File(path);
+          if (file.existsSync() && file.lengthSync() > _maxLogBytes) {
+            final old = File('$path.old');
+            if (old.existsSync()) old.deleteSync();
+            file.renameSync(old.path);
+          }
+          _raf = file.openSync(mode: FileMode.append);
+          _logPath = path;
+          _initialized = true;
+          break;
+        } catch (_) {
+          // naechsten Ort probieren
+        }
       }
-
-      final candidatePath = '$dir${Platform.pathSeparator}cb_funk_debug.log';
-      final file = File(candidatePath);
-
-      try {
-        _raf = file.openSync(mode: FileMode.append);
-        _logPath = candidatePath;
-        _initialized = true;
-      } catch (e) {
-        // Fallback falls Installationsverzeichnis keine Schreibrechte hat
-        final fallbackDir = Directory.systemTemp.path;
-        final fallbackPath =
-            '$fallbackDir${Platform.pathSeparator}cb_funk_debug.log';
-        final fallbackFile = File(fallbackPath);
-        _raf = fallbackFile.openSync(mode: FileMode.append);
-        _logPath = fallbackPath;
-        _initialized = true;
-      }
+      if (!_initialized) return;
 
       info('APP', '==================================================');
       info('APP', 'CB-Funk Logging initialisiert');

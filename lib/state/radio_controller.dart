@@ -1,7 +1,10 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:ui' show AppExitResponse;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../audio/audio_engine.dart';
@@ -198,6 +201,32 @@ class RadioController extends ChangeNotifier
     }
   }
 
+  /// Windows: Schliessen-Knopf, Alt+F4, Taskleiste. Sendung beenden und
+  /// Einstellungen sichern, bevor der Prozess endet.
+  @override
+  Future<AppExitResponse> didRequestAppExit() async {
+    try {
+      await prepareForExit().timeout(const Duration(seconds: 2));
+    } catch (_) {}
+    return AppExitResponse.exit;
+  }
+
+  Future<void> prepareForExit() async {
+    AppLogger.info('APP', 'Beenden angefordert: Sendung stoppen, Einstellungen sichern');
+    if (transmitting) pttUp();
+    if (gatewayEnabled) {
+      try {
+        await audio.stopGateway().timeout(const Duration(seconds: 1));
+      } catch (_) {}
+      try {
+        await _ptt?.close();
+      } catch (_) {}
+    }
+    _saveTimer?.cancel();
+    await _save();
+    AppLogger.close();
+  }
+
   Future<void> _recoverAfterResume() async {
     if (defaultTargetPlatform == TargetPlatform.windows) {
       audio.requestOutputHealthCheck();
@@ -289,11 +318,34 @@ class RadioController extends ChangeNotifier
   }
 
   // ---------- Speichern / Laden ----------
-  Future<void> loadSettings() async {
-    SharedPreferences p;
+  /// Laedt die Einstellungen. Ist die Einstellungsdatei defekt (z. B. nach
+  /// Stromausfall waehrend des Speicherns), wird sie beiseitegelegt; sonst
+  /// koennte die App nie wieder etwas speichern.
+  static Future<SharedPreferences?> _openPreferences() async {
     try {
-      p = await SharedPreferences.getInstance();
-    } catch (_) {
+      return await SharedPreferences.getInstance();
+    } catch (e, st) {
+      AppLogger.error('SETTINGS', 'Einstellungen nicht lesbar: $e', e, st);
+    }
+    if (!Platform.isWindows) return null;
+    try {
+      final dir = await getApplicationSupportDirectory();
+      final f = File('${dir.path}${Platform.pathSeparator}shared_preferences.json');
+      if (await f.exists()) {
+        final backup = '${f.path}.defekt';
+        await f.rename(backup);
+        AppLogger.warn('SETTINGS', 'Defekte Einstellungsdatei gesichert als $backup, starte mit Standardwerten');
+      }
+      return await SharedPreferences.getInstance();
+    } catch (e, st) {
+      AppLogger.error('SETTINGS', 'Einstellungen konnten nicht repariert werden: $e', e, st);
+      return null;
+    }
+  }
+
+  Future<void> loadSettings() async {
+    final p = await _openPreferences();
+    if (p == null) {
       _finishLoadingSettings();
       return;
     }
@@ -382,51 +434,85 @@ class RadioController extends ChangeNotifier
     }
   }
 
-  Future<void> _save() async {
+  Future<void> _saveChain = Future<void>.value();
+  bool _saveQueued = false;
+
+  /// Speichert alle Einstellungen. Aufrufe werden zusammengefasst und laufen
+  /// nacheinander. Geschrieben werden nur geaenderte Werte: Unter Windows
+  /// schreibt jeder einzelne set-Aufruf die komplette Datei neu (synchron im
+  /// UI-Thread, der auch den Audio-Takt erzeugt).
+  Future<void> _save() {
+    if (_saveQueued) return _saveChain;
+    _saveQueued = true;
+    _saveChain = _saveChain.then((_) {
+      _saveQueued = false;
+      return _writeSettings();
+    });
+    return _saveChain;
+  }
+
+  Map<String, Object?> _settingsSnapshot() => <String, Object?>{
+        'antenna': antenna.index,
+        'gatewayMode': gatewayMode.index,
+        'gatewayEnabled': gatewayEnabled,
+        'toggleInsteadOfHold': toggleInsteadOfHold,
+        'headsetButtonPtt': headsetButtonPtt,
+        'volumeDownPtt': volumeDownPtt,
+        'preferExternalMic': preferExternalMic,
+        'beepMode': beepMode,
+        'parrot': parrot,
+        'callSign': callSign,
+        'realisticRange': realisticRange,
+        'channel': channel,
+        'mod': modulation.index,
+        'volume': volume,
+        'squelch': squelch,
+        'rfGain': rfGain,
+        'clarifier': clarifier,
+        'txLevel': txLevel,
+        'micSensitivity': micSensitivity,
+        'echo': echo,
+        'nb': noiseBlanker,
+        'gwVox': gwVoxThreshold,
+        'gwHang': gwHangMs,
+        'gwIn': gwInGain,
+        'gwOut': gwOutGain,
+        'gwPre': gwPreMs,
+        'gwPost': gwPostMs,
+        'gwSerial': gwSerialPort,
+        'gwDtr': gwUseDtr,
+        'gwHid': gwHidKey,
+        'gwGpio': gwHidGpio,
+        'gwInput': gwInputId,
+        for (final a in KeyAction.values) 'key_${a.name}': keys.idFor(a),
+      };
+
+  Future<void> _writeSettings() async {
     try {
       final p = await SharedPreferences.getInstance();
-      await p.setInt('antenna', antenna.index);
-      await p.setInt('gatewayMode', gatewayMode.index);
-      await p.setBool('gatewayEnabled', gatewayEnabled);
-      await p.setBool('toggleInsteadOfHold', toggleInsteadOfHold);
-      await p.setBool('headsetButtonPtt', headsetButtonPtt);
-      await p.setBool('volumeDownPtt', volumeDownPtt);
-      await p.setBool('preferExternalMic', preferExternalMic);
-      await p.setInt('beepMode', beepMode);
-      await p.setBool('parrot', parrot);
-      await p.setString('callSign', callSign);
-      await p.setBool('realisticRange', realisticRange);
-      await p.setInt('channel', channel);
-      await p.setInt('mod', modulation.index);
-      await p.setDouble('volume', volume);
-      await p.setDouble('squelch', squelch);
-      await p.setDouble('rfGain', rfGain);
-      await p.setDouble('clarifier', clarifier);
-      await p.setDouble('txLevel', txLevel);
-      await p.setDouble('micSensitivity', micSensitivity);
-      await p.setBool('echo', echo);
-      await p.setBool('nb', noiseBlanker);
-      await p.setDouble('gwVox', gwVoxThreshold);
-      await p.setInt('gwHang', gwHangMs);
-      await p.setDouble('gwIn', gwInGain);
-      await p.setDouble('gwOut', gwOutGain);
-      await p.setInt('gwPre', gwPreMs);
-      await p.setInt('gwPost', gwPostMs);
-      await p.setString('gwSerial', gwSerialPort);
-      await p.setBool('gwDtr', gwUseDtr);
-      await p.setString('gwHid', gwHidKey);
-      await p.setInt('gwGpio', gwHidGpio);
-      await p.setString('gwInput', gwInputId);
-      for (final a in KeyAction.values) {
-        final id = keys.idFor(a);
-        if (id == null) {
-          await p.remove('key_${a.name}');
-        } else {
-          await p.setInt('key_${a.name}', id);
+      var written = 0;
+      for (final e in _settingsSnapshot().entries) {
+        final v = e.value;
+        if (p.get(e.key) == v) continue;
+        written++;
+        if (v == null) {
+          await p.remove(e.key);
+        } else if (v is bool) {
+          await p.setBool(e.key, v);
+        } else if (v is int) {
+          await p.setInt(e.key, v);
+        } else if (v is double) {
+          await p.setDouble(e.key, v);
+        } else if (v is String) {
+          await p.setString(e.key, v);
         }
       }
-    } catch (_) {
+      if (written > 0 && kDebugMode) {
+        AppLogger.info('SETTINGS', '$written Einstellung(en) gespeichert');
+      }
+    } catch (e) {
       // Keep transient storage failures from escaping a UI timer/input callback.
+      AppLogger.warn('SETTINGS', 'Speichern fehlgeschlagen: $e');
     }
   }
 

@@ -39,14 +39,21 @@ class RadioKey extends StatelessWidget {
                 color: active ? CbColors.displayBlue : Colors.black54,
                 width: 1.4),
           ),
-          child: Center(
-            child: Text(label,
-                style: TextStyle(
-                    fontWeight: FontWeight.w700,
-                    fontSize: fontSize,
-                    letterSpacing: 0.5,
-                    color: textColor ??
-                        (active ? CbColors.displayBlue : CbColors.text))),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            // Einzeilig; bei grosser Handyschrift lieber etwas kleiner als umbrechen
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(label,
+                  maxLines: 1,
+                  softWrap: false,
+                  style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      fontSize: fontSize,
+                      letterSpacing: 0.5,
+                      color: textColor ??
+                          (active ? CbColors.displayBlue : CbColors.text))),
+            ),
           ),
         ),
       ),

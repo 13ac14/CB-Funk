@@ -3,7 +3,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:window_manager/window_manager.dart';
+import '../platform/desktop_window.dart';
 import '../services/mqtt_service.dart';
 import '../state/radio_controller.dart';
 import 'settings_screen.dart';
@@ -18,54 +18,61 @@ class RadioScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final r = context.watch<RadioController>();
-    return Scaffold(
-      body: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [CbColors.bgTop, CbColors.bgBottom],
+    // Das Funkgeraet ist eine feste Gestaltung: Eine stark vergroesserte
+    // System-Schrift (Android "Schriftgroesse") sprengt sonst Tasten und
+    // Display. Der Einstellungsdialog behaelt die volle Vergroesserung.
+    return MediaQuery.withClampedTextScaling(
+      maxScaleFactor: 1.15,
+      child: Scaffold(
+        body: Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [CbColors.bgTop, CbColors.bgBottom],
+            ),
           ),
-        ),
-        child: SafeArea(
-          child: SizedBox.expand(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final contentWidth = constraints.maxWidth;
-                if (contentWidth >= 800 &&
-                    contentWidth > constraints.maxHeight) {
-                  return _landscape(context, r, constraints);
-                }
-                final horizontalPadding =
-                    (contentWidth * 0.018).clamp(6.0, 18.0);
-                final knobSize =
-                    ((contentWidth - horizontalPadding * 2 - 30) / 4)
-                        .clamp(64.0, 110.0);
-                return FittedBox(
-                  fit: BoxFit.scaleDown,
-                  alignment: Alignment.topCenter,
-                  child: SizedBox(
-                    width: contentWidth,
-                    child: Padding(
-                      padding: EdgeInsets.fromLTRB(
-                          horizontalPadding, 8, horizontalPadding, 8),
-                      child: Column(mainAxisSize: MainAxisSize.min, children: [
-                        _header(r),
-                        const SizedBox(height: 14),
-                        LcdDisplay(radio: r),
-                        const SizedBox(height: 14),
-                        _knobs(r, knobSize),
-                        const SizedBox(height: 14),
-                        _keys(context, r),
-                        const SizedBox(height: 12),
-                        _status(r),
-                        const SizedBox(height: 12),
-                        _ptt(r),
-                      ]),
+          child: SafeArea(
+            child: SizedBox.expand(
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final contentWidth = constraints.maxWidth;
+                  if (contentWidth >= 800 &&
+                      contentWidth > constraints.maxHeight) {
+                    return _landscape(context, r, constraints);
+                  }
+                  final horizontalPadding =
+                      (contentWidth * 0.018).clamp(6.0, 18.0);
+                  final knobSize =
+                      ((contentWidth - horizontalPadding * 2 - 30) / 4)
+                          .clamp(64.0, 110.0);
+                  return FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.topCenter,
+                    child: SizedBox(
+                      width: contentWidth,
+                      child: Padding(
+                        padding: EdgeInsets.fromLTRB(
+                            horizontalPadding, 8, horizontalPadding, 8),
+                        child:
+                            Column(mainAxisSize: MainAxisSize.min, children: [
+                          _header(r),
+                          const SizedBox(height: 14),
+                          LcdDisplay(radio: r),
+                          const SizedBox(height: 14),
+                          _knobs(r, knobSize),
+                          const SizedBox(height: 14),
+                          _keys(context, r),
+                          const SizedBox(height: 12),
+                          _status(r),
+                          const SizedBox(height: 12),
+                          _ptt(r),
+                        ]),
+                      ),
                     ),
-                  ),
-                );
-              },
+                  );
+                },
+              ),
             ),
           ),
         ),
@@ -121,7 +128,7 @@ class RadioScreen extends StatelessWidget {
                   const Positioned(
                     top: 0,
                     left: 0,
-                    right: 48,
+                    right: 84,
                     height: 18,
                     child: _DesktopDragRegion(),
                   ),
@@ -129,17 +136,21 @@ class RadioScreen extends StatelessWidget {
                   Positioned(
                     top: -12,
                     right: -12,
-                    child: IconButton(
-                      tooltip: 'Schließen',
-                      onPressed: () => unawaited(windowManager.close()),
-                      icon: const Icon(Icons.close, size: 20),
-                      style: IconButton.styleFrom(
-                        foregroundColor: const Color(0xFFE5E8E6),
-                        backgroundColor: const Color(0x55343A3C),
-                        minimumSize: const Size(28, 28),
-                        padding: EdgeInsets.zero,
-                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _windowButton(
+                          tooltip: 'Minimieren',
+                          icon: Icons.remove,
+                          onPressed: () => unawaited(DesktopWindow.minimize()),
+                        ),
+                        const SizedBox(width: 6),
+                        _windowButton(
+                          tooltip: 'Schließen',
+                          icon: Icons.close,
+                          onPressed: () => unawaited(_closeApp(r)),
+                        ),
+                      ],
                     ),
                   ),
               ],
@@ -149,6 +160,28 @@ class RadioScreen extends StatelessWidget {
       ),
     );
   }
+
+  Widget _windowButton({
+    required String tooltip,
+    required IconData icon,
+    required VoidCallback onPressed,
+  }) =>
+      IconButton(
+        tooltip: tooltip,
+        onPressed: onPressed,
+        icon: Icon(icon, size: 20),
+        style: IconButton.styleFrom(
+          foregroundColor: const Color(0xFFE5E8E6),
+          backgroundColor: const Color(0x55343A3C),
+          minimumSize: const Size(28, 28),
+          padding: EdgeInsets.zero,
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+      );
+
+  /// Schliesst wie Alt+F4; RadioController.didRequestAppExit sichert vorher
+  /// Einstellungen und beendet eine laufende Sendung.
+  Future<void> _closeApp(RadioController r) => DesktopWindow.close();
 
   Widget _desktopLeftPanel(RadioController r) => Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -615,91 +648,18 @@ class RadioScreen extends StatelessWidget {
       );
 }
 
-/// Moves the fixed-size desktop window with coalesced asynchronous position
-/// updates. This avoids Win32's modal caption-drag loop on Flutter's UI thread.
-class _DesktopDragRegion extends StatefulWidget {
+/// Ziehleiste oben am Fenster: Windows verschiebt das Fenster selbst, genau
+/// wie beim Ziehen an einer normalen Titelleiste.
+class _DesktopDragRegion extends StatelessWidget {
   const _DesktopDragRegion();
-
-  @override
-  State<_DesktopDragRegion> createState() => _DesktopDragRegionState();
-}
-
-class _DesktopDragRegionState extends State<_DesktopDragRegion> {
-  bool _dragging = false;
-  bool _moveLoopRunning = false;
-  Offset? _pointerOrigin;
-  Offset? _windowOrigin;
-  Offset? _latestPointer;
-  Offset? _lastRequestedPosition;
-
-  void _onPanStart(DragStartDetails details) {
-    _dragging = true;
-    _pointerOrigin = details.globalPosition;
-    _latestPointer = details.globalPosition;
-    _windowOrigin = null;
-    _lastRequestedPosition = null;
-    unawaited(_readWindowOrigin());
-  }
-
-  Future<void> _readWindowOrigin() async {
-    try {
-      final origin = await windowManager.getPosition();
-      if (!mounted || !_dragging) return;
-      _windowOrigin = origin;
-      _queueMove();
-    } catch (_) {
-      _dragging = false;
-    }
-  }
-
-  void _onPanUpdate(DragUpdateDetails details) {
-    _latestPointer = details.globalPosition;
-    _queueMove();
-  }
-
-  void _queueMove() {
-    if (!_dragging || _windowOrigin == null || _moveLoopRunning) return;
-    _moveLoopRunning = true;
-    unawaited(_drainMoves());
-  }
-
-  Future<void> _drainMoves() async {
-    try {
-      while (mounted && _dragging) {
-        final pointerOrigin = _pointerOrigin;
-        final windowOrigin = _windowOrigin;
-        final pointer = _latestPointer;
-        if (pointerOrigin == null || windowOrigin == null || pointer == null) {
-          break;
-        }
-
-        final requested = windowOrigin + (pointer - pointerOrigin);
-        if (requested == _lastRequestedPosition) break;
-        _lastRequestedPosition = requested;
-        await windowManager.setPosition(requested);
-
-        if (_latestPointer == pointer) break;
-      }
-    } catch (_) {
-      _dragging = false;
-    } finally {
-      _moveLoopRunning = false;
-    }
-  }
-
-  void _endPan(DragEndDetails _) {
-    _dragging = false;
-    _pointerOrigin = null;
-    _latestPointer = null;
-  }
 
   @override
   Widget build(BuildContext context) => GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onPanStart: _onPanStart,
-        onPanUpdate: _onPanUpdate,
-        onPanEnd: _endPan,
-        onPanCancel: () => _dragging = false,
-        child: const SizedBox.expand(),
+        onPanStart: (_) => unawaited(DesktopWindow.startDrag()),
+        child: const MouseRegion(
+          cursor: SystemMouseCursors.move,
+          child: SizedBox.expand(),
+        ),
       );
 }

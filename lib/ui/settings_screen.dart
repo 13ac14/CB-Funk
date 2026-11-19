@@ -375,7 +375,9 @@ class _SettingsDialogState extends State<_SettingsDialog> {
       _DevicePicker(
         key: const ValueKey('gateway-audio-input'),
         title: 'Audio-Eingang (vom Funkgerät)',
-        autoLabel: 'Standardgerät',
+        // Bewusst kein Standardgerät: sonst würde versehentlich das
+        // PC-Mikrofon (Raumgeräusche) ins Netz gesendet.
+        autoLabel: '– bitte Gerät wählen –',
         loader: GatewayDevices.listInputs,
         value: r.gwInputId,
         onChanged: (k) => r.updateGateway(inputId: k),

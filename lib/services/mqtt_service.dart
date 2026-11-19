@@ -48,6 +48,7 @@ class MqttService extends ChangeNotifier {
   // Anwesenheit auf dem Kanal: sid -> zuletzt gesehen
   final Map<int, DateTime> _stations = {};
   Timer? _heartbeat;
+  Timer? _stationRefresh;
 
   int get stationCount {
     final now = DateTime.now();
@@ -95,6 +96,7 @@ class MqttService extends ChangeNotifier {
       ..logging(on: false)
       ..onConnected = _onConnected
       ..onDisconnected = _onDisconnected
+      ..onAutoReconnect = _onAutoReconnect
       ..onAutoReconnected = _onConnected;
     _client = c;
 
@@ -253,6 +255,10 @@ class MqttService extends ChangeNotifier {
         }
         break;
       case 'state':
+        _stationRefresh ??= Timer.periodic(
+          const Duration(seconds: 8),
+          (_) => notifyListeners(),
+        );
         final wasConnected = _networkConnected;
         _networkConnected = message['connected'] == true;
         state = _networkConnected
@@ -313,6 +319,13 @@ class MqttService extends ChangeNotifier {
       _sendCtl({'hb': true});
       notifyListeners(); // Stationszahl aktualisieren (Timeout)
     });
+  }
+
+  void _onAutoReconnect() {
+    AppLogger.warn('MQTT', 'Verbindung verloren, automatische Neuverbindung läuft');
+    _heartbeat?.cancel();
+    state = LinkState.connecting;
+    notifyListeners();
   }
 
   void _onDisconnected() {
@@ -469,6 +482,7 @@ class MqttService extends ChangeNotifier {
       _networkReady = null;
     }
     _heartbeat?.cancel();
+    _stationRefresh?.cancel();
     _updatesSubscription?.cancel();
     try {
       _client?.disconnect();
@@ -491,12 +505,12 @@ void _mqttNetworkWorker(Map<String, Object> args) {
     final sb = StringBuffer('$timeStr [$level] [MQTT-ISOLATE] $msg');
     if (err != null) sb.write(' | FEHLER: $err');
     sb.writeln();
-    if (logPath.isNotEmpty) {
-      AppLogger.appendRaw(logPath, sb.toString());
-    }
     try {
+      // Der Haupt-Isolate schreibt die Zeile ins Log.
       mainPort.send({'kind': 'log', 'level': level, 'msg': msg, 'err': err?.toString()});
-    } catch (_) {}
+    } catch (_) {
+      if (logPath.isNotEmpty) AppLogger.appendRaw(logPath, sb.toString());
+    }
   }
 
   runZonedGuarded(() {
@@ -569,6 +583,16 @@ void _mqttNetworkWorker(Map<String, Object> args) {
       });
     }
 
+    // Verbindung abgerissen, mqtt_client verbindet selbst neu: Anzeige auf
+    // "Verbinde ..." statt weiter "Online" (Pakete gehen sonst ins Leere).
+    void onAutoReconnect() {
+      writeIsolateLog('WARN', 'Verbindung verloren, automatische Neuverbindung läuft');
+      connected = false;
+      connecting = true;
+      heartbeat?.cancel();
+      sendState();
+    }
+
     void onDisconnected() {
       writeIsolateLog('WARN', 'Broker-Verbindung getrennt (onDisconnected)');
       connected = false;
@@ -587,6 +611,7 @@ void _mqttNetworkWorker(Map<String, Object> args) {
       final previousClient = client;
       client = null;
       previousClient?.onDisconnected = null;
+      previousClient?.onAutoReconnect = null;
       previousClient?.onAutoReconnected = null;
       try {
         previousClient?.disconnect();
@@ -600,6 +625,7 @@ void _mqttNetworkWorker(Map<String, Object> args) {
         ..logging(on: false)
         ..onConnected = onConnected
         ..onDisconnected = onDisconnected
+        ..onAutoReconnect = onAutoReconnect
         ..onAutoReconnected = onConnected;
       client = c;
       try {
@@ -662,6 +688,7 @@ void _mqttNetworkWorker(Map<String, Object> args) {
       connected = false;
       connecting = false;
       oldClient?.onDisconnected = null;
+      oldClient?.onAutoReconnect = null;
       oldClient?.onAutoReconnected = null;
       try {
         oldClient?.disconnect();

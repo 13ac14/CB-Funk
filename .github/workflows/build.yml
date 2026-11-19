@@ -13,31 +13,11 @@ jobs:
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: 17 }
       - uses: subosito/flutter-action@v2
-        with: { channel: stable }
-      - run: flutter create --platforms=android,windows --project-name cb_funk --org de.cbfunk .
-      - name: Android-Berechtigungen und minSdk setzen
-        run: |
-          M=android/app/src/main/AndroidManifest.xml
-          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n    <application#' $M
-          for f in android/app/build.gradle android/app/build.gradle.kts; do
-            if [ -f "$f" ]; then sed -i -E 's/minSdk(Version)?( =)? ?flutter\.minSdkVersion/minSdk = 24/' "$f"; fi
-          done
-          grep -n "uses-permission" $M
-          grep -n "minSdk" android/app/build.gradle* || true
-      - name: Native USB-HID-Code (Android) einbauen
-        run: |
-          F=$(find android/app/src/main -name 'MainActivity.kt' | head -n1)
-          PKG=$(grep -m1 '^package ' "$F" | sed 's/package //; s/\r//')
-          sed "s/__PKG__/$PKG/" android_native/MainActivity.kt > "$F"
-          sed -i 's#<application#<uses-feature android:name="android.hardware.usb.host" android:required="false"/>\n    <application#' android/app/src/main/AndroidManifest.xml
-          head -n 3 "$F"
-      - name: App-Name und Icon setzen
-        run: |
-          sed -i 's/android:label="[^"]*"/android:label="CB-Funk"/' android/app/src/main/AndroidManifest.xml
-          for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
-            mkdir -p android/app/src/main/res/$d
-            cp assets/icons/android/$d/ic_launcher.png android/app/src/main/res/$d/ic_launcher.png
-          done
+        # Feste Version = gleicher Stand wie beim lokalen Bauen
+        with: { channel: stable, flutter-version: 3.41.1 }
+      # Der Ordner android/ ist vollstaendig im Projekt (Manifest, MainActivity mit
+      # USB-HID und Hintergrund-Ton, Icons). Er wird unveraendert gebaut - frueher
+      # hat dieser Schritt die MainActivity durch eine veraltete Kopie ersetzt.
       - run: flutter pub get
       - name: Tests (blockieren den Build nicht)
         run: flutter test
@@ -54,21 +34,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
-        with: { channel: stable }
+        # Feste Version = gleicher Stand wie beim lokalen Bauen
+        with: { channel: stable, flutter-version: 3.41.1 }
       - run: flutter create --platforms=android,windows --project-name cb_funk --org de.cbfunk .
-      - name: Fenstername, Fenstergroesse und Icon setzen
+      # Fenstername/-groesse stehen fest in windows/runner (main.cpp, Runner.rc)
+      - name: Icon setzen
         shell: pwsh
-        run: |
-          Copy-Item assets/icons/app_icon.ico windows/runner/resources/app_icon.ico -Force
-          (Get-Content windows/runner/main.cpp) -replace 'L"cb_funk"', 'L"CB-Funk"' -replace 'Size size\(1280, 720\)', 'Size size(520, 920)' | Set-Content windows/runner/main.cpp
-          (Get-Content windows/runner/Runner.rc) -replace '"cb_funk"', '"CB-Funk"' | Set-Content windows/runner/Runner.rc
+        run: Copy-Item assets/icons/app_icon.ico windows/runner/resources/app_icon.ico -Force
       - run: flutter pub get
       - run: flutter build windows --release
       - name: Installer bauen (Inno Setup)
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
-          Invoke-WebRequest https://aka.ms/vs/17/release/vc_redist.x64.exe -OutFile installer/vc_redist.x64.exe
           $v = (Select-String -Path pubspec.yaml -Pattern '^version:\s*([0-9.]+)').Matches[0].Groups[1].Value
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" installer\cbfunk.iss
           Get-ChildItem installer\Output
@@ -76,6 +54,12 @@ jobs:
         with:
           name: CB-Funk-Windows-Installer
           path: installer/Output/*.exe
+      - name: Pruefen, ob die VC++-Laufzeit beiliegt
+        shell: pwsh
+        run: |
+          foreach ($d in 'msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll') {
+            if (-not (Test-Path "build/windows/x64/runner/Release/$d")) { throw "$d fehlt im Release-Ordner" }
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: CB-Funk-windows-portable

@@ -219,13 +219,15 @@ class AudioEngine {
 
   bool get needsOutputRecovery {
     if (!state.power || _recoveringOutput || _initializingOutput) return false;
-    if (!_outputReady) return true;
     final now = DateTime.now();
 
-    // Verhindere Erholungs-Schleifen bei Inaktivitaet (Cooldown 15 Sekunden)
+    // Verhindere Erholungs-Schleifen (Cooldown 15 Sekunden) - auch wenn die
+    // Ausgabe nie bereit war (z. B. PC ohne Soundkarte/Lautsprecher): sonst
+    // wuerde SoLoud alle 3 Sekunden neu gestartet.
     if (now.difference(_lastRecoveryAt) < const Duration(seconds: 15)) {
       return false;
     }
+    if (!_outputReady) return true;
 
     final windowHealthCheck = _windowHealthCheckRequested;
     _windowHealthCheckRequested = false;
@@ -1180,7 +1182,20 @@ class AudioEngine {
   final List<int> _txPcm = <int>[];
   int? _oddByte;
 
-  Future<void> startTx() async {
+  /// Alle Mikrofon-Aufrufe (start/stop) laufen nacheinander, nie
+  /// gleichzeitig: schnelles Druecken/Loslassen der Sendetaste hat sonst
+  /// start() und stop() des nativen Recorders ueberlappen lassen.
+  Future<void> _micQueue = Future<void>.value();
+
+  Future<void> _enqueueMic(Future<void> Function() op) {
+    final next = _micQueue.then((_) => op()).catchError((Object e, StackTrace st) {
+      AppLogger.error('AUDIO', 'Mikrofon-Operation fehlgeschlagen: $e', e, st);
+    });
+    _micQueue = next;
+    return next;
+  }
+
+  Future<void> startTx() {
     final token = ++_txToken;
     _tailTimer?.cancel();
     _tailTimer = null;
@@ -1188,6 +1203,11 @@ class AudioEngine {
       'AUDIO',
       'startTx: PTT gedrückt (Kanal ${state.channel}, Mod ${state.modulation.name}, Papagei: ${state.parrot})',
     );
+    return _enqueueMic(() => _startTxImpl(token));
+  }
+
+  Future<void> _startTxImpl(int token) async {
+    if (token != _txToken) return; // PTT schon wieder losgelassen
 
     // Defensiv: laufende Aufnahme zuerst stoppen (verhindert doppelte MF-Session)
     try {
@@ -1209,28 +1229,16 @@ class AudioEngine {
       }
       if (!hasPerm) {
         AppLogger.error('AUDIO', 'startTx: Mikrofon-Berechtigung fehlt');
-        _setError('Mikrofon-Berechtigung fehlt');
-        _txActive = false;
+        _setError(Platform.isWindows
+            ? 'Mikrofon gesperrt (Windows-Einstellungen › Datenschutz › Mikrofon)'
+            : 'Mikrofon-Berechtigung fehlt');
         return;
       }
+      if (token != _txToken) return;
 
-      List<InputDevice> devices = [];
-      try {
-        devices = await _rec.listInputDevices().timeout(
-          const Duration(seconds: 2),
-          onTimeout: () => <InputDevice>[],
-        );
-      } catch (_) {
-        devices = [];
-      }
-      if (devices.isEmpty) {
-        AppLogger.warn('AUDIO', 'startTx: Kein Audio-Eingabegerät vorhanden');
-        _setError('Kein Mikrofon angeschlossen');
-        _txActive = false;
-        return;
-      }
-
-      // startStream() kann auf fehlerhaften Treibern eine PlatformException werfen
+      // Direkt starten; die Geräteliste wird nur im Fehlerfall abgefragt
+      // (spart bei jedem Drücken der Sendetaste Zeit = kein abgeschnittener
+      // Wortanfang).
       Stream<Uint8List>? stream;
       try {
         stream = await _rec
@@ -1247,8 +1255,16 @@ class AudioEngine {
             .timeout(const Duration(seconds: 5));
       } catch (e, st) {
         AppLogger.error('AUDIO', 'startTx: Mikrofon konnte nicht gestartet werden: $e', e, st);
-        _setError('Mikrofon konnte nicht gestartet werden: $e');
-        _txActive = false;
+        var devices = <InputDevice>[];
+        try {
+          devices = await _rec.listInputDevices().timeout(
+            const Duration(seconds: 2),
+            onTimeout: () => <InputDevice>[],
+          );
+        } catch (_) {}
+        _setError(devices.isEmpty
+            ? 'Kein Mikrofon gefunden'
+            : 'Mikrofon konnte nicht gestartet werden: $e');
         return;
       }
 
@@ -1290,13 +1306,16 @@ class AudioEngine {
     }
   }
 
-  Future<void> stopTx() async {
+  Future<void> stopTx() {
     final token = ++_txToken;
     final had = _txActive;
     final wasParrot = _txParrot;
-    _txActive = false;
+    _txActive = false; // ab sofort keine Mikrofon-Daten mehr senden
     AppLogger.info('AUDIO', 'stopTx: PTT losgelassen (hatte gesendet: $had, Papagei: $wasParrot)');
+    return _enqueueMic(() => _stopTxImpl(token, had, wasParrot));
+  }
 
+  Future<void> _stopTxImpl(int token, bool had, bool wasParrot) async {
     // micSub cancel darf nie werfen
     try {
       await _micSub?.cancel();
@@ -1329,6 +1348,7 @@ class AudioEngine {
   }
 
   void _onMic(Uint8List chunk) {
+    if (!_txActive) return; // PTT schon losgelassen, Stream laeuft noch aus
     var data = chunk;
     if (_oddByte != null) {
       final b = BytesBuilder()

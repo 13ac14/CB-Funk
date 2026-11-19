@@ -11,7 +11,10 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.net.Uri
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
@@ -86,12 +89,23 @@ class MainActivity : FlutterActivity() {
 				val serviceIntent = Intent(this, BackgroundAudioService::class.java)
 				when (call.method) {
 					"start" -> {
-						if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-							startForegroundService(serviceIntent)
+						// Laeuft der Dienst schon, nichts tun. Ab Android 12 darf ein
+						// Vordergrund-Dienst nicht aus dem Hintergrund gestartet werden
+						// (ForegroundServiceStartNotAllowedException = Absturz).
+						if (BackgroundAudioService.isRunning) {
+							result.success(true)
 						} else {
-							startService(serviceIntent)
+							try {
+								if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+									startForegroundService(serviceIntent)
+								} else {
+									startService(serviceIntent)
+								}
+								result.success(true)
+							} catch (e: Exception) {
+								result.success(false)
+							}
 						}
-						result.success(true)
 					}
 					"stop" -> result.success(stopService(serviceIntent))
 					"status" -> {
@@ -207,6 +221,17 @@ class MainActivity : FlutterActivity() {
 		}
 		connection = null
 		hidInterface = null
+	}
+
+	override fun onCreate(savedInstanceState: Bundle?) {
+		super.onCreate(savedInstanceState)
+		// Android 13+: ohne diese Erlaubnis ist die Meldung "CB-Funk aktiv" des
+		// Hintergrund-Dienstes unsichtbar. Einmalig nachfragen.
+		if (Build.VERSION.SDK_INT >= 33 &&
+			checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+		) {
+			requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 4711)
+		}
 	}
 
 	override fun onDestroy() {

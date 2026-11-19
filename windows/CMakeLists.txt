@@ -42,6 +42,9 @@ function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100")
   target_compile_options(${TARGET} PRIVATE /EHsc)
   target_compile_definitions(${TARGET} PRIVATE "_HAS_EXCEPTIONS=0")
+  # Schutz vor Abstuerzen mit aelterer msvcp140.dll auf dem Zielrechner
+  # (std::mutex-Aenderung ab Visual Studio 17.10). Gilt auch fuer Plugins.
+  target_compile_definitions(${TARGET} PRIVATE "_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR")
   target_compile_definitions(${TARGET} PRIVATE "$<$<CONFIG:Debug>:_DEBUG>")
 endfunction()
 
@@ -85,6 +88,20 @@ if(PLUGIN_BUNDLED_LIBRARIES)
   install(FILES "${PLUGIN_BUNDLED_LIBRARIES}"
     DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
     COMPONENT Runtime)
+endif()
+
+# Visual-C++-Laufzeit (msvcp140.dll, vcruntime140*.dll) direkt neben die exe
+# legen. Dann startet die App auch auf PCs ohne (oder mit veralteter)
+# "Visual C++ Redistributable" - auch die portable Version.
+set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
+set(CMAKE_INSTALL_UCRT_LIBRARIES FALSE)
+include(InstallRequiredSystemLibraries)
+if(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+  install(PROGRAMS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+    COMPONENT Runtime)
+else()
+  message(WARNING "Visual-C++-Laufzeit nicht gefunden - wird nicht mitgeliefert")
 endif()
 
 # Copy the native assets provided by the build.dart from all packages.

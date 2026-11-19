@@ -3,6 +3,8 @@
 #include <dwmapi.h>
 #include <flutter_windows.h>
 
+#include <algorithm>
+
 #include "resource.h"
 
 namespace {
@@ -16,7 +18,7 @@ namespace {
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
-constexpr const wchar_t kWindowClassName[] = L"FLUTTER_RUNNER_WIN32_WINDOW";
+constexpr const wchar_t kWindowClassName[] = L"CBFUNK_RUNNER_WIN32_WINDOW";
 
 /// Registry key for app theme preference.
 ///
@@ -26,21 +28,13 @@ constexpr const wchar_t kGetPreferredBrightnessRegKey[] =
   L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 constexpr const wchar_t kGetPreferredBrightnessRegValue[] = L"AppsUseLightTheme";
 
-constexpr LONG_PTR kForbiddenWindowStyles =
-    WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME | WS_SYSMENU |
-    WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+// Randloses Fenster: kein Rahmen, keine Titelleiste, keine Groessenaenderung.
+// WS_SYSMENU + WS_MINIMIZEBOX: Minimieren/Wiederherstellen ueber die Taskleiste
+// und Alt+F4 funktionieren wie bei jedem normalen Fenster.
+constexpr DWORD kWindowStyle = WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX;
 
-void EnforcePopupStyle(HWND window) {
-  const LONG_PTR current_style = GetWindowLongPtr(window, GWL_STYLE);
-  const LONG_PTR popup_style = (current_style & ~kForbiddenWindowStyles) |
-                               WS_POPUP;
-  if (popup_style == current_style) {
-    return;
-  }
-
-  SetWindowLongPtr(window, GWL_STYLE, popup_style);
-  PostMessage(window, kRefreshPopupFrameMessage, 0, 0);
-}
+// Anteil des Arbeitsbereichs, den das Fenster hoechstens einnimmt.
+constexpr double kMaxWorkAreaShare = 0.96;
 
 // The number of Win32Window objects that currently exist.
 static int g_active_window_count = 0;
@@ -113,7 +107,8 @@ const wchar_t* WindowClassRegistrar::GetWindowClass() {
     window_class.hInstance = GetModuleHandle(nullptr);
     window_class.hIcon =
         LoadIcon(window_class.hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
-    window_class.hbrBackground = 0;
+    // Dunkler Hintergrund statt weissem Aufblitzen vor dem ersten Frame.
+    window_class.hbrBackground = CreateSolidBrush(RGB(0x1B, 0x1D, 0x21));
     window_class.lpszMenuName = nullptr;
     window_class.lpfnWndProc = Win32Window::WndProc;
     RegisterClass(&window_class);
@@ -136,43 +131,60 @@ Win32Window::~Win32Window() {
   Destroy();
 }
 
-bool Win32Window::Create(const std::wstring& title,
-                         const Point& origin,
-                         const Size& size) {
+bool Win32Window::Create(const std::wstring& title, const Size& max_size) {
   Destroy();
 
   const wchar_t* window_class =
       WindowClassRegistrar::GetInstance()->GetWindowClass();
 
-  const POINT target_point = {static_cast<LONG>(origin.x),
-                              static_cast<LONG>(origin.y)};
-  HMONITOR monitor = MonitorFromPoint(target_point, MONITOR_DEFAULTTONEAREST);
+  // Monitor unter dem Mauszeiger (dort hat der Nutzer die App gestartet).
+  POINT cursor{0, 0};
+  GetCursorPos(&cursor);
+  HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO monitor_info{};
+  monitor_info.cbSize = sizeof(monitor_info);
+  RECT work{0, 0, 1280, 720};
+  if (GetMonitorInfo(monitor, &monitor_info)) {
+    work = monitor_info.rcWork;
+  }
+  const LONG work_width = work.right - work.left;
+  const LONG work_height = work.bottom - work.top;
+
   UINT dpi = FlutterDesktopGetDpiForMonitor(monitor);
   double scale_factor = dpi / 96.0;
-  fixed_window_width_ = Scale(size.width, scale_factor);
-  fixed_window_height_ = Scale(size.height, scale_factor);
+  double width = Scale(max_size.width, scale_factor);
+  double height = Scale(max_size.height, scale_factor);
 
-  HWND window = CreateWindowEx(
-      WS_EX_APPWINDOW, window_class, title.c_str(),
-      // WS_POPUP has no non-client frame or caption at the Win32 level. The
-      // Flutter window_manager plugin configures and shows this hidden window.
-      WS_POPUP,
-      Scale(origin.x, scale_factor), Scale(origin.y, scale_factor),
-      fixed_window_width_, fixed_window_height_,
-      nullptr, nullptr, GetModuleHandle(nullptr), this);
+  // Kleine Bildschirme / hohe Skalierung (z. B. Laptop 1920x1080 bei 150 %):
+  // Fenster proportional verkleinern, statt ueber den Rand hinauszuragen.
+  // Die Oberflaeche skaliert in Flutter mit (feste 16:9-Leinwand).
+  const double fit = std::min({1.0, kMaxWorkAreaShare * work_width / width,
+                               kMaxWorkAreaShare * work_height / height});
+  width *= fit;
+  height *= fit;
+
+  const int w = static_cast<int>(width);
+  const int h = static_cast<int>(height);
+  const int x = work.left + (work_width - w) / 2;
+  const int y = work.top + (work_height - h) / 2;
+
+  HWND window = CreateWindowEx(WS_EX_APPWINDOW, window_class, title.c_str(),
+                               kWindowStyle, x, y, w, h, nullptr, nullptr,
+                               GetModuleHandle(nullptr), this);
 
   if (!window) {
     return false;
   }
 
-  EnforcePopupStyle(window);
   UpdateTheme(window);
 
   return OnCreate();
 }
 
 bool Win32Window::Show() {
-  return ShowWindow(window_handle_, SW_SHOWNORMAL);
+  const bool shown = ShowWindow(window_handle_, SW_SHOWNORMAL);
+  SetForegroundWindow(window_handle_);
+  return shown;
 }
 
 // static
@@ -201,37 +213,6 @@ Win32Window::MessageHandler(HWND hwnd,
                             WPARAM const wparam,
                             LPARAM const lparam) noexcept {
   switch (message) {
-    case WM_NCCALCSIZE:
-      // Reserve no non-client area. This also prevents window_manager's
-      // hidden-title-bar handling from reintroducing a client inset/border.
-      return 0;
-
-    case WM_NCPAINT:
-      return 0;
-
-    case WM_NCACTIVATE:
-      return TRUE;
-
-    case WM_ERASEBKGND:
-      // The Flutter child paints the full client area; avoid a white GDI flash.
-      return 1;
-
-    case WM_STYLECHANGED:
-      if (wparam == GWL_STYLE) {
-        // The window_manager plugin may adjust style bits while configuring
-        // the hidden title bar. Keep the host window popup and undecorated.
-        EnforcePopupStyle(hwnd);
-      }
-      return 0;
-
-    case kRefreshPopupFrameMessage:
-      // Recalculate the native frame after returning from the plugin's style
-      // callback, avoiding nested USER32/Flutter window-procedure calls.
-      SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
-                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
-                       SWP_FRAMECHANGED);
-      return 0;
-
     case WM_DESTROY:
       window_handle_ = nullptr;
       Destroy();
@@ -241,81 +222,28 @@ Win32Window::MessageHandler(HWND hwnd,
       return 0;
 
     case WM_DPICHANGED: {
-      // Avoid nested position/resize notifications while the DPI message is
-      // still being dispatched through the Win32 message pump.
-      if (lparam != 0) {
-        pending_dpi_rect_ = *reinterpret_cast<RECT*>(lparam);
-        dpi_rect_pending_ = true;
-        PostMessage(hwnd, kApplyDpiRectMessage, 0, 0);
-      }
-      return 0;
-    }
-    case kApplyDpiRectMessage:
-      if (dpi_rect_pending_) {
-        dpi_rect_pending_ = false;
-        const LONG width = pending_dpi_rect_.right - pending_dpi_rect_.left;
-        const LONG height = pending_dpi_rect_.bottom - pending_dpi_rect_.top;
-        SetWindowPos(hwnd, nullptr, pending_dpi_rect_.left,
-                     pending_dpi_rect_.top, width, height,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-      }
-      return 0;
-    case kFocusChildMessage:
-      if (child_content_ != nullptr && IsWindow(child_content_) &&
-          IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
-        SetFocus(child_content_);
-      }
-      return 0;
-    case kRestoreWindowMessage:
-      if (IsIconic(hwnd)) {
-        ShowWindow(hwnd, SW_RESTORE);
-      }
-      return 0;
-    case WM_SYSCOMMAND:
-      // The app deliberately has no minimize/maximize frame controls. Ignore
-      // shell/keyboard minimize requests as a fallback against taskbar restore
-      // transitions that previously triggered the UI hang.
-      if ((wparam & 0xFFF0) == SC_MINIMIZE ||
-          (wparam & 0xFFF0) == SC_MAXIMIZE ||
-          (wparam & 0xFFF0) == SC_SIZE) {
-        return 0;
-      }
-      break;
-    case WM_GETMINMAXINFO: {
-      auto min_max = reinterpret_cast<MINMAXINFO*>(lparam);
-      if (min_max != nullptr && fixed_window_width_ > 0 &&
-          fixed_window_height_ > 0) {
-        min_max->ptMinTrackSize.x = fixed_window_width_;
-        min_max->ptMinTrackSize.y = fixed_window_height_;
-        min_max->ptMaxTrackSize.x = fixed_window_width_;
-        min_max->ptMaxTrackSize.y = fixed_window_height_;
-      }
-      return 0;
-    }
-    case WM_SIZE:
-      if (wparam == SIZE_MINIMIZED) {
-        PostMessage(hwnd, kRestoreWindowMessage, 0, 0);
-        return 0;
-      }
-      // FlutterWindow posts kResizeChildMessage so child layout/redraw happens
-      // after the current top-level window message has returned.
-      return 0;
+      auto newRectSize = reinterpret_cast<RECT*>(lparam);
+      LONG newWidth = newRectSize->right - newRectSize->left;
+      LONG newHeight = newRectSize->bottom - newRectSize->top;
 
-    case kResizeChildMessage: {
+      SetWindowPos(hwnd, nullptr, newRectSize->left, newRectSize->top, newWidth,
+                   newHeight, SWP_NOZORDER | SWP_NOACTIVATE);
+
+      return 0;
+    }
+    case WM_SIZE: {
       RECT rect = GetClientArea();
-      if (child_content_ != nullptr && IsWindow(child_content_)) {
-        // Avoid a synchronous repaint inside the Windows message pump. Flutter
-        // receives WM_SIZE and schedules its own frame after this call.
+      if (child_content_ != nullptr) {
+        // Size and position the child window.
         MoveWindow(child_content_, rect.left, rect.top, rect.right - rect.left,
-                   rect.bottom - rect.top, FALSE);
+                   rect.bottom - rect.top, TRUE);
       }
       return 0;
     }
 
     case WM_ACTIVATE:
-      if (LOWORD(wparam) != WA_INACTIVE && child_content_ != nullptr &&
-          IsWindow(child_content_)) {
-        PostMessage(hwnd, kFocusChildMessage, 0, 0);
+      if (child_content_ != nullptr) {
+        SetFocus(child_content_);
       }
       return 0;
 

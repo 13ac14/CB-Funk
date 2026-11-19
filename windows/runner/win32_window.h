@@ -7,25 +7,15 @@
 #include <memory>
 #include <string>
 
-// Resize the Flutter child after the current top-level window message has
-// completed, so size changes do not force a nested synchronous repaint.
-inline constexpr UINT kResizeChildMessage = WM_APP + 1;
-inline constexpr UINT kApplyDpiRectMessage = WM_APP + 2;
-inline constexpr UINT kFocusChildMessage = WM_APP + 3;
-inline constexpr UINT kRestoreWindowMessage = WM_APP + 4;
-inline constexpr UINT kRefreshPopupFrameMessage = WM_APP + 5;
-
-// A class abstraction for a high DPI-aware Win32 Window. Intended to be
-// inherited from by classes that wish to specialize with custom
-// rendering and input handling
+// Basiert auf der Standard-Vorlage von Flutter (flutter create).
+// Abweichungen fuer CB-Funk:
+//  - randloses Fenster (WS_POPUP) ohne Groessenaenderung, aber mit
+//    Minimieren ueber die Taskleiste
+//  - Fenstergroesse wird an den Arbeitsbereich des Monitors angepasst
+//    (16:9, hoechstens 1280x720 logische Pixel) und zentriert
+// Alle Fenster-Nachrichten gehen wie in der Vorlage an Flutter weiter.
 class Win32Window {
  public:
-  struct Point {
-    unsigned int x;
-    unsigned int y;
-    Point(unsigned int x, unsigned int y) : x(x), y(y) {}
-  };
-
   struct Size {
     unsigned int width;
     unsigned int height;
@@ -36,13 +26,9 @@ class Win32Window {
   Win32Window();
   virtual ~Win32Window();
 
-  // Creates a win32 window with |title| that is positioned and sized using
-  // |origin| and |size|. New windows are created on the default monitor. Window
-  // sizes are specified to the OS in physical pixels, hence to ensure a
-  // consistent size this function will scale the inputted width and height as
-  // as appropriate for the default monitor. The window is invisible until
-  // |Show| is called. Returns true if the window was created successfully.
-  bool Create(const std::wstring& title, const Point& origin, const Size& size);
+  // Erzeugt das (noch unsichtbare) Fenster mit hoechstens |max_size|
+  // logischen Pixeln, zentriert auf dem Monitor unter dem Mauszeiger.
+  bool Create(const std::wstring& title, const Size& max_size);
 
   // Show the current window. Returns true if the window was successfully shown.
   bool Show();
@@ -105,12 +91,6 @@ class Win32Window {
 
   // window handle for hosted content.
   HWND child_content_ = nullptr;
-
-  // The fixed landscape size is used for both minimum and maximum tracking.
-  LONG fixed_window_width_ = 0;
-  LONG fixed_window_height_ = 0;
-  RECT pending_dpi_rect_{};
-  bool dpi_rect_pending_ = false;
 };
 
 #endif  // RUNNER_WIN32_WINDOW_H_

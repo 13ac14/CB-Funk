@@ -43,3 +43,7 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Build-Ergebnisse (Installer, portable ZIP) gehoeren nicht ins Repo
+installer/Output/
+installer/*.exe
