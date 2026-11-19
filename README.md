@@ -18,6 +18,31 @@ Auf dem Server (Mosquitto), z. B. /etc/mosquitto/conf.d/cbfunk.conf:
    - CB-Funk-Windows-Installer       -> CB-Funk-Setup-<Version>.exe (Desktop-Verknuepfung waehlbar)
    - CB-Funk-windows-portable        -> Ordner ohne Installation
 
+## Auf dem eigenen PC bauen
+
+Zuerst pruefen, ob der PC bereit ist (zeigt Fehler mit Abhilfe, Bericht landet auf dem Desktop):
+
+    powershell -ExecutionPolicy Bypass -File toolsuild_check.ps1
+
+Was gebraucht wird:
+- Flutter 3.41.1, am besten unter C:lutter (kein Pfad mit Leerzeichen)
+- Fuer die exe: Visual Studio 2022 Community (NICHT VS Code) mit "Desktopentwicklung mit C++".
+  Meldet der Visual Studio Installer die Installation als unvollstaendig, baut Flutter nicht
+  ("Unable to find suitable Visual Studio toolchain"), obwohl alles installiert aussieht:
+  im Installer "Reparieren", dann Neustart.
+- Fuer die APK: Android Studio (bringt Android SDK und Java mit), danach einmal
+  `flutter doctor --android-licenses`.
+- Nie `gradle ...` direkt aufrufen, immer `flutter build apk`. Das Projekt bringt seine
+  Gradle-Version (8.14.3) selbst mit; ein separat installiertes Gradle 9 passt nicht.
+
+Empfehlungen:
+- Projekt nach C:\dev\cb_funk legen. Beim APK-Build entstehen Pfade bis ca. 250 Zeichen,
+  Windows erlaubt ohne Einstellung nur 260. Lange Pfade erlauben (als Admin):
+  `reg add HKLM\SYSTEM\CurrentControlSet\Control\FileSystem /v LongPathsEnabled /t REG_DWORD /d 1 /f`
+- Der erste APK-Build laedt 3-4 GB nach (Gradle, NDK, Pakete) und dauert entsprechend.
+  Danach: APK ca. 2-5 Minuten, exe ca. 2 Minuten.
+- Ohne eigene Entwicklungsumgebung: einfach auf GitHub pushen, der Workflow baut beides.
+
 ## Lokal bauen (Flutter + Inno Setup 6 vorhanden)
     installer\build_installer.bat       (Windows-Installer)
     flutter build apk --release         (Ergebnis: buildpp\outputslutter-apkpp-release.apk)
