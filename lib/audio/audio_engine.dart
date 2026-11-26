@@ -38,6 +38,7 @@ abstract class RadioAudioState {
   // Gateway
   bool get gatewayEnabled;
   GatewayMode get gatewayMode;
+  String get gwOutputId;
   double get gwVoxThreshold; // 0..1 (Eingangspegel-Schwelle)
   int get gwHangMs; // VOX-Nachlauf Funk -> Netz
   double get gwInGain;
@@ -46,12 +47,19 @@ abstract class RadioAudioState {
   int get gwPostMs; // PTT-Nachlauf
 }
 
+class DigitalPcmFrame {
+  const DigitalPcmFrame({required this.modulation, required this.samples});
+
+  final int modulation;
+  final Int16List samples;
+}
+
 /// Empfang: MQTT -> Jitter-Puffer -> Clarifier -> Squelch/Rauschen/NB -> Lautsprecher
 /// Senden:  Mikrofon -> 8 kHz -> Echo -> mu-law -> MQTT (+ Roger-Beep, Echo-Schwanz)
 /// Papagei: Mikrofon -> lokal aufnehmen -> nach PTT-Ende abspielen (nichts wird gesendet)
 ///
 /// WICHTIG: Alle flutter_soloud-Aufrufe stehen NUR in dieser Datei
-/// (init / _feed / dispose).
+/// (init / _feed / watchdog / dispose).
 class AudioEngine {
   AudioEngine(this.mqtt, this.state);
 
@@ -66,6 +74,7 @@ class AudioEngine {
 
   /// Suchlauf: auf einem anderen Kanal wurde ein hoerbares Signal erkannt
   void Function(int channel)? onScanHit;
+  void Function(DigitalPcmFrame frame)? onDigitalSamples;
   String? error;
 
   /// Sendepegel (Faktor)
@@ -94,10 +103,14 @@ class AudioEngine {
   bool _recoveringOutput = false;
   bool _initializingOutput = false;
   bool _outputReady = false;
+  bool _windowsOutputUnavailable = false;
   bool _windowHealthCheckRequested = false;
   int _consecutiveFeedErrors = 0;
   Duration? _lastConsumedAudioTime;
   DateTime _lastOutputProgressAt = DateTime.now();
+  static const String _windowsOutputPausedMessage =
+      'Audioausgabe stockt – Wiedergabegerät prüfen';
+  StreamSubscription<AudioDeviceStartFailure>? _deviceStartFailureSub;
   StreamSubscription<Uint8List>? _audioSub;
   StreamSubscription<Map<String, dynamic>>? _ctlSub;
   final FreqShifter _shifter = FreqShifter(_rate);
@@ -124,6 +137,18 @@ class AudioEngine {
 
   Future<void> init() async {
     AppLogger.info('AUDIO', 'AudioEngine init() aufgerufen');
+    if (Platform.isWindows) {
+      _deviceStartFailureSub ??= SoLoud.instance.audioDeviceStartFailures.listen(
+        (failure) {
+          AppLogger.error(
+            'AUDIO',
+            'SoLoud meldet fehlgeschlagenen Windows-Audiogerätestart: $failure',
+          );
+          _setError('Windows-Audioausgabe wird neu gestartet …');
+          if (_outputReady && state.power) unawaited(recoverOutput());
+        },
+      );
+    }
     try {
       await _initializeOutput();
     } catch (e, st) {
@@ -163,13 +188,49 @@ class AudioEngine {
     if (_initializingOutput) return;
     _initializingOutput = true;
     _outputReady = false;
-    AppLogger.info('AUDIO', 'Initialisiere Audio-Ausgabe (SoLoud, Rate: $_rate Hz)');
+    AppLogger.info(
+      'AUDIO',
+      'Initialisiere Audio-Ausgabe (SoLoud, Rate: $_rate Hz)',
+    );
     try {
       if (!SoLoud.instance.isInitialized) {
         try {
-          await SoLoud.instance.init().timeout(const Duration(seconds: 5));
+          PlaybackDevice? outputDevice;
+          if (Platform.isWindows) {
+            final devices = SoLoud.instance.listPlaybackDevices();
+            for (final device in devices) {
+              AppLogger.info(
+                'AUDIO',
+                'Windows-Ausgabegerät: id=${device.id}, default=${device.isDefault}, name="${device.name}"',
+              );
+            }
+            if (devices.isEmpty) {
+              throw StateError(
+                'Windows meldet kein verfügbares Audioausgabegerät',
+              );
+            }
+            outputDevice = _resolvePlaybackDevice(devices, state.gwOutputId);
+            AppLogger.info(
+              'AUDIO',
+              'SoLoud wird explizit mit dem Windows-Ausgabegerät "${outputDevice.name}" (id=${outputDevice.id}) gestartet',
+            );
+          }
+          await SoLoud.instance
+              .init(
+                device: outputDevice,
+                sampleRate: 44100,
+                // Keep the device mixer ahead of the 8 kHz, 20 ms RX feed.
+                // This is about 93 ms at 44.1 kHz and tolerates UI scheduling
+                // jitter without changing the RF packet/frame timing.
+                bufferSize: 4096,
+                channels: Channels.stereo,
+              )
+              .timeout(const Duration(seconds: 5));
         } catch (e, st) {
-          AppLogger.warn('AUDIO', 'SoLoud.instance.init() fehlgeschlagen (keine Soundkarte?): $e');
+          AppLogger.warn(
+            'AUDIO',
+            'SoLoud.instance.init() fehlgeschlagen (keine Soundkarte?): $e',
+          );
           _setError('Audio-Ausgabe nicht verfügbar ($e)');
           return;
         }
@@ -179,19 +240,43 @@ class AudioEngine {
         _setError('Audio-System nicht bereit');
         return;
       }
+      if (Platform.isWindows) {
+        // A permanently fed radio stream must not have its output device
+        // auto-stopped during a short BufferStream underrun. SoLoud 5.x keeps
+        // the device lifecycle serialized off the UI isolate.
+        SoLoud.instance.setAudioDeviceIdleTimeout(null);
+        AppLogger.info(
+          'AUDIO',
+          'Windows-Audioausgabegerät bleibt während Funkbetrieb aktiv',
+        );
+      }
       AudioSource? streamOut;
       try {
         streamOut = SoLoud.instance.setBufferStream(
-          // Bound native memory if the Windows output device stops consuming.
-          maxBufferSizeDuration: const Duration(seconds: 2),
+          // A short packet gap can pause a released stream while it waits for
+          // bufferingTimeNeeds. Give it enough headroom to survive longer
+          // Windows endpoint stalls: SoLoud permanently ends the stream if
+          // this limit is reached, after which no later RX audio is playable.
+          // Released buffers discard already played frames, so this is a cap,
+          // not a pre-allocation.
+          maxBufferSizeDuration: const Duration(minutes: 30),
           sampleRate: _rate,
           channels: Channels.mono,
           format: BufferType.s16le,
           bufferingType: BufferingType.released,
-          bufferingTimeNeeds: 0.1,
+          // This is a real-time PCM stream that is continuously fed (including
+          // silence between calls). Do not make SoLoud wait for a large refill
+          // window after an underrun; the next 20 ms frame should resume it.
+          bufferingTimeNeeds: 0.001,
           onBuffering: (buffering, _, __) {
-            _bufferingSince =
-                buffering ? (_bufferingSince ?? DateTime.now()) : null;
+            _bufferingSince = buffering
+                ? (_bufferingSince ?? DateTime.now())
+                : null;
+            if (!buffering &&
+                Platform.isWindows &&
+                error == _windowsOutputPausedMessage) {
+              _setError(null);
+            }
           },
         );
       } catch (e, st) {
@@ -199,26 +284,107 @@ class AudioEngine {
         _setError('Audio-Stream-Fehler: $e');
         return;
       }
+      _consecutiveFeedErrors = 0;
       _out = streamOut;
       if (streamOut != null) {
-        _outHandle = await SoLoud.instance.play(streamOut).timeout(const Duration(seconds: 4));
+        // SoLoud may leave a released BufferStream voice idle if play() is
+        // called before it contains any PCM. Prime it with 100 ms of silence
+        // so the device mixer has real frames to start; live RX/parrot frames
+        // replace this startup padding immediately afterward.
+        try {
+          final primingSilence = Int16List(_rate ~/ 10);
+          SoLoud.instance.addAudioDataStream(
+            streamOut,
+            primingSilence.buffer.asUint8List(),
+          );
+        } catch (e, st) {
+          AppLogger.error(
+            'AUDIO',
+            'SoLoud-Stream konnte nicht vorgefüllt werden',
+            e,
+            st,
+          );
+          _setError('Audio-Stream konnte nicht gestartet werden: $e');
+          _out = null;
+          return;
+        }
+        _outHandle = SoLoud.instance.play(streamOut);
         _lastConsumedAudioTime = null;
         _lastOutputProgressAt = DateTime.now();
         _outputReady = true;
-        AppLogger.info('AUDIO', 'Audio-Ausgabe erfolgreich initialisiert');
+        AppLogger.info(
+          'AUDIO',
+          'Audio-Ausgabe erfolgreich initialisiert (Gerätestatus: ${Platform.isWindows ? SoLoud.instance.getAudioDeviceState() : 'n/a'})',
+        );
       }
     } catch (e, st) {
-      AppLogger.error('AUDIO', 'Initialisierung der Audio-Ausgabe fehlgeschlagen', e, st);
+      AppLogger.error(
+        'AUDIO',
+        'Initialisierung der Audio-Ausgabe fehlgeschlagen',
+        e,
+        st,
+      );
       _setError('Audio-Ausgabe: $e');
     } finally {
       _initializingOutput = false;
     }
   }
 
+  PlaybackDevice _resolvePlaybackDevice(
+    List<PlaybackDevice> devices,
+    String deviceId,
+  ) {
+    if (deviceId.isNotEmpty) {
+      for (final device in devices) {
+        if (device.id.toString() == deviceId) return device;
+      }
+      AppLogger.warn(
+        'AUDIO',
+        'Gespeichertes Ausgabegerät "$deviceId" ist nicht verfügbar; verwende Windows-Standard',
+      );
+    }
+    return devices.firstWhere(
+      (device) => device.isDefault,
+      orElse: () => devices.first,
+    );
+  }
+
+  Future<void> changeOutputDevice(String deviceId) async {
+    if (!Platform.isWindows) return;
+    while (_initializingOutput) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+    }
+    if (!SoLoud.instance.isInitialized) return;
+
+    final devices = SoLoud.instance.listPlaybackDevices();
+    if (devices.isEmpty) {
+      throw StateError('Windows meldet kein verfügbares Audioausgabegerät');
+    }
+    final device = deviceId.isEmpty
+        ? _resolvePlaybackDevice(devices, '')
+        : devices.where((d) => d.id.toString() == deviceId).firstOrNull;
+    if (device == null) {
+      throw StateError(
+        'Das ausgewählte Windows-Ausgabegerät "$deviceId" ist nicht mehr verfügbar',
+      );
+    }
+
+    await SoLoud.instance.changeDevice(newDevice: device);
+    AppLogger.info(
+      'AUDIO',
+      'Windows-Ausgabegerät gewechselt: "${device.name}" (id=${device.id})',
+    );
+  }
+
   DateTime _lastRecoveryAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   bool get needsOutputRecovery {
-    if (!state.power || _recoveringOutput || _initializingOutput) return false;
+    if (!state.power ||
+        _recoveringOutput ||
+        _initializingOutput ||
+        _windowsOutputUnavailable) {
+      return false;
+    }
     final now = DateTime.now();
 
     // Verhindere Erholungs-Schleifen (Cooldown 15 Sekunden) - auch wenn die
@@ -245,7 +411,10 @@ class AudioEngine {
     }
     if (_consecutiveFeedErrors >= 3 &&
         now.difference(_lastRxPacketAt) < const Duration(seconds: 3)) {
-      AppLogger.warn('AUDIO', 'needsOutputRecovery: Zu viele Feed-Fehler während RX ($_consecutiveFeedErrors)');
+      AppLogger.warn(
+        'AUDIO',
+        'needsOutputRecovery: Zu viele Feed-Fehler während RX ($_consecutiveFeedErrors)',
+      );
       return true;
     }
     // A native voice can end after a Windows endpoint/device change while
@@ -254,7 +423,10 @@ class AudioEngine {
     if (handle == null) return true;
     try {
       if (!SoLoud.instance.getIsValidVoiceHandle(handle)) {
-        AppLogger.warn('AUDIO', 'needsOutputRecovery: Voice-Handle nicht mehr gültig');
+        AppLogger.warn(
+          'AUDIO',
+          'needsOutputRecovery: Voice-Handle nicht mehr gültig',
+        );
         return true;
       }
       final output = _out;
@@ -262,32 +434,81 @@ class AudioEngine {
 
       // Nur prüfen, ob Stream konsumiert wird, wenn auch tatsächlich Audio empfangen/abgespielt wird!
       // Bei Inaktivität (kein Signal, Band ruhig) ist das Ausbleiben von Fortschritten völlig normal.
-      final hasRecentRx = now.difference(_lastRxPacketAt) < const Duration(seconds: 4);
-      final isActivelyPlaying = _talker != null ||
+      final hasRecentRx =
+          now.difference(_lastRxPacketAt) < const Duration(seconds: 4);
+      final isActivelyPlaying =
+          _talker != null ||
           hasRecentRx ||
           _parrotPlay.isNotEmpty ||
           (_gwRunning && _gwState == 2);
+
+      if (Platform.isWindows && isActivelyPlaying) {
+        final deviceState = SoLoud.instance.getAudioDeviceState();
+        if (deviceState != AudioDeviceState.started) {
+          AppLogger.warn(
+            'AUDIO',
+            'Windows-Ausgabegerät ist während aktivem Audio nicht gestartet (state: $deviceState)',
+          );
+          if (error != _windowsOutputPausedMessage) {
+            _setError(_windowsOutputPausedMessage);
+          }
+          return true;
+        }
+      }
 
       final consumed = SoLoud.instance.getStreamTimeConsumed(output);
       final previous = _lastConsumedAudioTime;
       if (previous == null || consumed > previous) {
         _lastConsumedAudioTime = consumed;
         _lastOutputProgressAt = now;
+        if (Platform.isWindows && error == _windowsOutputPausedMessage) {
+          _setError(null);
+        }
       } else if (isActivelyPlaying &&
           now.difference(_lastOutputProgressAt) > const Duration(seconds: 4)) {
         // Der Stream konsumiert trotz aktiver Wiedergabe keine Frames
-        AppLogger.warn('AUDIO', 'needsOutputRecovery: Stream konsumiert keine Frames bei aktiver Wiedergabe');
-        return true;
+        if (Platform.isWindows) {
+          if (error != _windowsOutputPausedMessage) {
+            AppLogger.warn(
+              'AUDIO',
+              'SoLoud-Stream konsumiert trotz RX keine Frames; starte Windows-Audiogerät neu',
+            );
+            _setError(_windowsOutputPausedMessage);
+          }
+          return true;
+        } else {
+          AppLogger.warn(
+            'AUDIO',
+            'needsOutputRecovery: Stream konsumiert keine Frames bei aktiver Wiedergabe',
+          );
+          return true;
+        }
       }
     } catch (e) {
-      AppLogger.warn('AUDIO', 'needsOutputRecovery: Ausnahme bei Handle-Prüfung: $e');
+      AppLogger.warn(
+        'AUDIO',
+        'needsOutputRecovery: Ausnahme bei Handle-Prüfung: $e',
+      );
       return true;
     }
     final bufferingSince = _bufferingSince;
     if (bufferingSince != null &&
         now.difference(bufferingSince) > const Duration(seconds: 2) &&
         now.difference(_lastRxPacketAt) < const Duration(seconds: 2)) {
-      AppLogger.warn('AUDIO', 'needsOutputRecovery: Buffering hängt während Empfang');
+      if (Platform.isWindows) {
+        if (error != _windowsOutputPausedMessage) {
+          AppLogger.warn(
+            'AUDIO',
+            'SoLoud-Stream bleibt im Buffering; starte Windows-Audiogerät neu',
+          );
+          _setError(_windowsOutputPausedMessage);
+        }
+        return true;
+      }
+      AppLogger.warn(
+        'AUDIO',
+        'needsOutputRecovery: Buffering hängt während Empfang',
+      );
       return true;
     }
     return false;
@@ -295,9 +516,71 @@ class AudioEngine {
 
   Future<void> recoverOutput() async {
     if (_recoveringOutput || !state.power) return;
+    if (Platform.isWindows) {
+      if (_consecutiveFeedErrors >= 3) {
+        // A full/ended PCM source cannot be revived by restarting its device.
+        // Quarantine it without calling native stop/dispose on the UI isolate.
+        _windowsOutputUnavailable = true;
+        _outputReady = false;
+        _out = null;
+        _outHandle = null;
+        AppLogger.error(
+          'AUDIO',
+          'Windows-PCM-Stream nimmt wiederholt keine Frames an; Stream quarantänisiert',
+        );
+        _setError('Audio-Stream ist beendet – bitte CB-Funk neu starten');
+        return;
+      }
+
+      // flutter_soloud 5 serializes device lifecycle operations away from the
+      // UI isolate and preserves active voices. Restart only the native output
+      // device; never rebuild or dispose the BufferStream/voice here.
+      _recoveringOutput = true;
+      _lastRecoveryAt = DateTime.now();
+      try {
+        final before = SoLoud.instance.getAudioDeviceState();
+        AppLogger.warn(
+          'AUDIO',
+          'Wiederherstellung des Windows-Audiogeräts gestartet (state: $before)',
+        );
+        if (before == AudioDeviceState.started) {
+          await SoLoud.instance
+              .stopAudioDevice(force: true)
+              .timeout(const Duration(seconds: 8));
+        }
+        await SoLoud.instance.startAudioDevice().timeout(
+          const Duration(seconds: 10),
+        );
+        final after = SoLoud.instance.getAudioDeviceState();
+        AppLogger.info('AUDIO', 'Windows-Audiogerät nach Neustart: $after');
+        if (after != AudioDeviceState.started) {
+          throw StateError(
+            'Windows meldet Audiogerätestatus $after statt started',
+          );
+        }
+        _lastConsumedAudioTime = null;
+        _lastOutputProgressAt = DateTime.now();
+        _bufferingSince = null;
+        if (error == _windowsOutputPausedMessage) _setError(null);
+      } catch (e, st) {
+        AppLogger.error(
+          'AUDIO',
+          'Windows-Audiogerät konnte nicht neu gestartet werden',
+          e,
+          st,
+        );
+        _setError('Windows-Audioausgabe: $e');
+      } finally {
+        _recoveringOutput = false;
+      }
+      return;
+    }
     _recoveringOutput = true;
     _lastRecoveryAt = DateTime.now();
-    AppLogger.info('AUDIO', 'Audio-Wiederherstellung (recoverOutput) wird ausgeführt');
+    AppLogger.info(
+      'AUDIO',
+      'Audio-Wiederherstellung (recoverOutput) wird ausgeführt',
+    );
     final oldOutput = _out;
     final oldHandle = _outHandle;
     _out = null;
@@ -308,28 +591,41 @@ class AudioEngine {
       if (SoLoud.instance.isInitialized) {
         if (oldHandle != null) {
           try {
-            await SoLoud.instance.stop(oldHandle).timeout(
-              const Duration(milliseconds: 500),
-              onTimeout: () {
-                AppLogger.warn('AUDIO', 'Timeout beim Stoppen des alten Audio-Handles');
-              },
-            );
+            await SoLoud.instance
+                .stop(oldHandle)
+                .timeout(
+                  const Duration(milliseconds: 500),
+                  onTimeout: () {
+                    AppLogger.warn(
+                      'AUDIO',
+                      'Timeout beim Stoppen des alten Audio-Handles',
+                    );
+                  },
+                );
           } catch (_) {}
         }
         if (oldOutput != null) {
           try {
-            await SoLoud.instance.disposeSource(oldOutput).timeout(
-              const Duration(milliseconds: 500),
-              onTimeout: () {
-                AppLogger.warn('AUDIO', 'Timeout beim Freigeben der alten Audio-Quelle');
-              },
-            );
+            await SoLoud.instance
+                .disposeSource(oldOutput)
+                .timeout(
+                  const Duration(milliseconds: 500),
+                  onTimeout: () {
+                    AppLogger.warn(
+                      'AUDIO',
+                      'Timeout beim Freigeben der alten Audio-Quelle',
+                    );
+                  },
+                );
           } catch (_) {}
         }
       }
       await _initializeOutput();
       _lastTickAt = DateTime.now();
-      AppLogger.info('AUDIO', 'Audio-Wiederherstellung erfolgreich abgeschlossen');
+      AppLogger.info(
+        'AUDIO',
+        'Audio-Wiederherstellung erfolgreich abgeschlossen',
+      );
     } catch (e, st) {
       _outputReady = false;
       AppLogger.error('AUDIO', 'Audio-Wiederherstellung fehlgeschlagen', e, st);
@@ -340,7 +636,8 @@ class AudioEngine {
   }
 
   /// Called after a Windows window move/focus transition or app resume. The
-  /// native stream will be recreated by the regular watchdog, outside WndProc.
+  /// watchdog checks stream health outside WndProc; it never tears down or
+  /// recreates the native SoLoud device on the UI isolate.
   void requestOutputHealthCheck() {
     if (state.power && _outputReady) _windowHealthCheckRequested = true;
   }
@@ -351,9 +648,17 @@ class AudioEngine {
     try {
       SoLoud.instance.addAudioDataStream(o, samples.buffer.asUint8List());
       _consecutiveFeedErrors = 0;
-    } catch (_) {
+    } catch (e, st) {
+      if (_consecutiveFeedErrors == 0) {
+        AppLogger.error(
+          'AUDIO',
+          'SoLoud-Audio-Stream nimmt keine Daten an: $e',
+          e,
+          st,
+        );
+      }
       _consecutiveFeedErrors++;
-      /* Puffer voll o.ae. - Frame verwerfen */
+      /* Fehlerhaften Frame verwerfen; der Watchdog behandelt den Ausfall. */
     }
   }
 
@@ -370,8 +675,15 @@ class AudioEngine {
     _underruns = 0;
     _tailTicks = 0;
     _resetAmFilter();
+    _clearReceiveMeter();
     _tailTimer?.cancel();
     _tailTimer = null;
+  }
+
+  void _clearReceiveMeter() {
+    if (_level <= 0) return;
+    _level = 0;
+    onLevel?.call(0);
   }
 
   static const bool _mqttHasLocationData = false;
@@ -395,11 +707,24 @@ class AudioEngine {
   void _onAudio(Uint8List data) {
     final p = AudioPacket.parse(data);
     if (p == null || !state.power || state.transmitting) return;
+    if (AudioPacket.isDigitalModulation(p.modulation)) {
+      if (!AudioPacket.isDigitalModulationForChannel(p.channel, p.modulation) ||
+          p.channel != state.channel ||
+          (p.sender & 0x7FFFFFFF) == mqtt.senderId ||
+          (state.gatewayEnabled && (p.sender & 0x80000000) != 0)) {
+        return;
+      }
+      _receiveDigitalAudio(p);
+      return;
+    }
     // Modulation is already part of the packet header. Treat each mode as an
     // independent channel before scan detection, signal strength, or audio.
     if (p.modulation < 0 ||
         p.modulation >= Modulation.values.length ||
         p.modulation != state.modulation.index) {
+      if (_talker != null && _rxMod != state.modulation.index) {
+        _clearReceiveMeter();
+      }
       return;
     }
     final gw = state.gatewayEnabled;
@@ -432,7 +757,7 @@ class AudioEngine {
         now.difference(_lastRx).inMilliseconds < 300) {
       return; // nur ein Sprecher gleichzeitig
     }
-    if (_talker != p.sender) {
+    if (_talker != p.sender || _rxMod != p.modulation) {
       _fifo.clear();
       _primed = false;
       _underruns = 0;
@@ -450,6 +775,25 @@ class AudioEngine {
       _fifo.add(MuLaw.decode(b));
     }
     final cap = gw ? (_rate * 1.5).round() : _rate ~/ 2.5;
+    while (_fifo.length > cap) {
+      _fifo.removeFirst();
+    }
+  }
+
+  void _receiveDigitalAudio(AudioPacket packet) {
+    final samples = AudioPacket.isLinearPcmModulation(packet.modulation)
+        ? AudioPacket.decodeLinearPcm(packet.payload)
+        : Int16List.fromList(packet.payload.map(MuLaw.decode).toList());
+    if (samples == null) return;
+    if (_talker != packet.sender || _rxMod != packet.modulation) {
+      _fifo.clear();
+      _talker = packet.sender;
+    }
+    _rxMod = packet.modulation;
+    _rxAntDb = packet.antennaDb;
+    _lastRx = DateTime.now();
+    _fifo.addAll(samples);
+    final cap = (_rate * 1.5).round();
     while (_fifo.length > cap) {
       _fifo.removeFirst();
     }
@@ -487,6 +831,13 @@ class AudioEngine {
       return;
     }
 
+    if (_talker != null &&
+        (_talker! & 0x7FFFFFFF) != mqtt.senderId &&
+        AudioPacket.isDigitalModulation(_rxMod)) {
+      _tickLocalDigitalRx(out);
+      return;
+    }
+
     if (state.parrot) {
       _tickParrot(out);
       return;
@@ -507,6 +858,7 @@ class AudioEngine {
     }
 
     final hasTalker = _talker != null;
+    final modMatch = _rxMod == state.modulation.index;
 
     var strengthDb = 0.0;
     var level = 0.0;
@@ -516,8 +868,9 @@ class AudioEngine {
     }
 
     final thresholdDb = state.squelch * 50.0;
-    final squelchOpen =
-        hasTalker ? strengthDb >= thresholdDb : state.squelch < 0.12;
+    final squelchOpen = hasTalker
+        ? strengthDb >= thresholdDb
+        : state.squelch < 0.12;
     if (hasTalker || _tailTicks == 0) _lastOpen = squelchOpen;
 
     final voice = Float64List(_frame);
@@ -559,7 +912,6 @@ class AudioEngine {
       }
     }
 
-    final modMatch = _rxMod == state.modulation.index;
     final playVoice = voiceValid && squelchOpen && modMatch;
 
     final tail = !hasTalker && _tailTicks > 0;
@@ -567,23 +919,33 @@ class AudioEngine {
 
     final voiceGain = (0.25 + 0.75 * level) * state.rfGain;
     final vol = state.volume * state.volume * 1.6;
-    final staticOpen = !hasTalker &&
+    final staticOpen =
+        !hasTalker &&
         state.squelch <= 0.01 &&
         (state.modulation == Modulation.fm ||
             state.modulation == Modulation.am);
 
     for (var i = 0; i < _frame; i++) {
       final v = playVoice ? voice[i] * voiceGain : 0.0;
-      final hiss =
-          staticOpen ? (_noiseRandom.nextDouble() * 2.0 - 1.0) * 0.07 : 0.0;
+      final hiss = staticOpen
+          ? (_noiseRandom.nextDouble() * 2.0 - 1.0) * 0.07
+          : 0.0;
       final mixed = v + hiss;
-      final mix =
-          state.noiseBlanker ? mixed.clamp(-0.7, 0.7).toDouble() : mixed;
+      final mix = state.noiseBlanker
+          ? mixed.clamp(-0.7, 0.7).toDouble()
+          : mixed;
       final s = (mix * vol).clamp(-1.0, 1.0).toDouble();
       out[i] = (s * 32767.0).round();
     }
 
-    _level = level > _level ? level : _level * 0.85 + level * 0.15;
+    final meterLevel = hasTalker && modMatch ? level : 0.0;
+    if (hasTalker && !modMatch) {
+      _level = 0;
+    } else {
+      _level = meterLevel > _level
+          ? meterLevel
+          : _level * 0.85 + meterLevel * 0.15;
+    }
     if (_level < 0.01) _level = 0;
     onLevel?.call(_level);
 
@@ -664,7 +1026,10 @@ class AudioEngine {
 
   Future<void> startGateway({String inputId = ''}) async {
     if (_gwRunning) return;
-    AppLogger.info('GATEWAY', 'Starte Gateway Audio-Eingang (inputId: "$inputId")');
+    AppLogger.info(
+      'GATEWAY',
+      'Starte Gateway Audio-Eingang (inputId: "$inputId")',
+    );
     try {
       // 1. Mikrofon-Berechtigung abfragen
       bool hasPerm = false;
@@ -678,7 +1043,10 @@ class AudioEngine {
         hasPerm = false;
       }
       if (!hasPerm) {
-        AppLogger.warn('GATEWAY', 'Mikrofon-Berechtigung fehlt oder nicht erreichbar');
+        AppLogger.warn(
+          'GATEWAY',
+          'Mikrofon-Berechtigung fehlt oder nicht erreichbar',
+        );
         _setError('Mikrofon-Berechtigung fehlt');
         _setGwInfo('Keine Berechtigung');
         return;
@@ -701,7 +1069,9 @@ class AudioEngine {
           'GATEWAY',
           'Keine Audio-Eingabegeräte auf dem System gefunden. Gateway wartet auf manuelle Auswahl.',
         );
-        _setError('Kein Audio-Eingang gefunden (Soundkarte in Einstellungen wählen)');
+        _setError(
+          'Kein Audio-Eingang gefunden (Soundkarte in Einstellungen wählen)',
+        );
         _setGwInfo('Kein Audiogerät');
         return;
       }
@@ -731,28 +1101,40 @@ class AudioEngine {
           'GATEWAY',
           'Gespeichertes Audiogerät "$inputId" ist auf diesem PC nicht vorhanden oder offline.',
         );
-        _setError('Gespeichertes Audiogerät nicht gefunden (bitte in Einstellungen wählen)');
+        _setError(
+          'Gespeichertes Audiogerät nicht gefunden (bitte in Einstellungen wählen)',
+        );
         _setGwInfo('Gerät offline');
         return;
       }
 
-      AppLogger.info('GATEWAY', 'Öffne Audiogerät: "${dev.label}" (ID: ${dev.id})');
+      AppLogger.info(
+        'GATEWAY',
+        'Öffne Audiogerät: "${dev.label}" (ID: ${dev.id})',
+      );
 
       Stream<Uint8List>? stream;
       try {
-        stream = await _gwRec.startStream(
-          RecordConfig(
-            encoder: AudioEncoder.pcm16bits,
-            sampleRate: AppConfig.micRate,
-            numChannels: 1,
-            device: dev,
-            echoCancel: false,
-            noiseSuppress: false,
-            autoGain: false,
-          ),
-        ).timeout(const Duration(seconds: 5));
+        stream = await _gwRec
+            .startStream(
+              RecordConfig(
+                encoder: AudioEncoder.pcm16bits,
+                sampleRate: AppConfig.micRate,
+                numChannels: 1,
+                device: dev,
+                echoCancel: false,
+                noiseSuppress: false,
+                autoGain: false,
+              ),
+            )
+            .timeout(const Duration(seconds: 5));
       } catch (e, st) {
-        AppLogger.error('GATEWAY', 'startStream fehlgeschlagen für Gerät "${dev.label}": $e', e, st);
+        AppLogger.error(
+          'GATEWAY',
+          'startStream fehlgeschlagen für Gerät "${dev.label}": $e',
+          e,
+          st,
+        );
         _setError('Gerät konnte nicht geöffnet werden: $e');
         _setGwInfo('Fehler beim Öffnen');
         return;
@@ -853,7 +1235,24 @@ class AudioEngine {
   /// VOX-Erkennung Funk -> Netz
   void _gwProcessFrame(Float64List f, double lvl) {
     _gwInLevel = lvl;
-    final busy = _gwState != 0 ||
+    final digitalMode = state.channel == 25
+        ? AudioPacket.sstvModulation
+        : state.channel == 24
+        ? AudioPacket.packetRadioModulation
+        : null;
+    if (digitalMode != null) {
+      onDigitalSamples?.call(
+        DigitalPcmFrame(
+          modulation: digitalMode,
+          samples: Int16List.fromList(
+            f.map((sample) => sample.round()).toList(growable: false),
+          ),
+        ),
+      );
+      return;
+    }
+    final busy =
+        _gwState != 0 ||
         _talker != null ||
         DateTime.now().isBefore(_gwIgnoreUntil);
     if (busy) {
@@ -925,7 +1324,10 @@ class AudioEngine {
     // Sicherheits-Sendezeitbegrenzung
     if (_gwState != 0) {
       if (++_gwTxTicks > AppConfig.gwMaxTxSeconds * 50) {
-        AppLogger.warn('GATEWAY', 'Sicherheits-Sendezeitbegrenzung (${AppConfig.gwMaxTxSeconds} s) erreicht!');
+        AppLogger.warn(
+          'GATEWAY',
+          'Sicherheits-Sendezeitbegrenzung (${AppConfig.gwMaxTxSeconds} s) erreicht!',
+        );
         _gwKey(false);
         _gwState = 0;
         _gwTxTicks = 0;
@@ -998,6 +1400,26 @@ class AudioEngine {
       _gwState == 0 ? _gwInLevel : (peak * 2.0).clamp(0.0, 1.0).toDouble(),
     );
     _feed(out);
+  }
+
+  void _tickLocalDigitalRx(Int16List out) {
+    final gain = state.volume;
+    var peak = 0.0;
+    for (var i = 0; i < _frame && _fifo.isNotEmpty; i++) {
+      final sample = (_fifo.removeFirst() * gain)
+          .round()
+          .clamp(-32768, 32767)
+          .toInt();
+      out[i] = sample;
+      peak = math.max(peak, sample.abs() / 32768.0);
+    }
+    onLevel?.call((peak * 2.0).clamp(0.0, 1.0).toDouble());
+    _feed(out);
+    if (_fifo.isEmpty &&
+        DateTime.now().difference(_lastRx) >
+            const Duration(milliseconds: 300)) {
+      _endTalker();
+    }
   }
 
   // ---------- Papagei: eigene Aufnahme abspielen ----------
@@ -1089,7 +1511,8 @@ class AudioEngine {
       if (mode == 3) {
         for (var i = 0; i < _frame; i++) {
           final elapsed = _rogerIdx * _frame + i;
-          final freq = 850 +
+          final freq =
+              850 +
               650 *
                   (0.5 +
                       0.5 * math.sin(2 * math.pi * elapsed / (_rate * 0.12)));
@@ -1126,6 +1549,34 @@ class AudioEngine {
       enc[j] = MuLaw.encode(v);
     }
     return enc;
+  }
+
+  void queueDigitalTxSamples({
+    required int channel,
+    required int modulation,
+    required Int16List samples,
+  }) {
+    if (!state.power ||
+        !state.gatewayEnabled ||
+        channel != state.channel ||
+        !AudioPacket.isDigitalModulation(modulation)) {
+      return;
+    }
+    final sender = mqtt.senderId;
+    if (_talker != null && _talker != sender) return;
+    if (_talker != sender) {
+      _fifo.clear();
+      _talker = sender;
+      _primed = false;
+    }
+    _rxMod = modulation;
+    _rxAntDb = state.antennaDb;
+    _lastRx = DateTime.now();
+    _fifo.addAll(samples);
+    final cap = (_rate * 1.5).round();
+    while (_fifo.length > cap) {
+      _fifo.removeFirst();
+    }
   }
 
   void _publish(Uint8List enc, {bool gw = false}) {
@@ -1167,6 +1618,10 @@ class AudioEngine {
     _parrotPlay
       ..clear()
       ..addAll(_parrotRec);
+    AppLogger.info(
+      'AUDIO',
+      'Papagei-Aufnahme abgeschlossen: ${_parrotRec.length} Samples, Wiedergabe vorbereitet: ${_parrotPlay.length} Samples',
+    );
     _parrotRec.clear();
   }
 
@@ -1188,7 +1643,10 @@ class AudioEngine {
   Future<void> _micQueue = Future<void>.value();
 
   Future<void> _enqueueMic(Future<void> Function() op) {
-    final next = _micQueue.then((_) => op()).catchError((Object e, StackTrace st) {
+    final next = _micQueue.then((_) => op()).catchError((
+      Object e,
+      StackTrace st,
+    ) {
       AppLogger.error('AUDIO', 'Mikrofon-Operation fehlgeschlagen: $e', e, st);
     });
     _micQueue = next;
@@ -1211,8 +1669,10 @@ class AudioEngine {
 
     // Defensiv: laufende Aufnahme zuerst stoppen (verhindert doppelte MF-Session)
     try {
-      if (await _rec.isRecording()
-          .timeout(const Duration(seconds: 2), onTimeout: () => false)) {
+      if (await _rec.isRecording().timeout(
+        const Duration(seconds: 2),
+        onTimeout: () => false,
+      )) {
         await _rec.stop().timeout(const Duration(seconds: 2));
       }
     } catch (_) {}
@@ -1221,17 +1681,20 @@ class AudioEngine {
       // hasPermission() kann auf bestimmten Windows-10-Treibern hängen → Timeout
       bool hasPerm = false;
       try {
-        hasPerm = await _rec
-            .hasPermission()
-            .timeout(const Duration(seconds: 3), onTimeout: () => false);
+        hasPerm = await _rec.hasPermission().timeout(
+          const Duration(seconds: 3),
+          onTimeout: () => false,
+        );
       } catch (_) {
         hasPerm = false;
       }
       if (!hasPerm) {
         AppLogger.error('AUDIO', 'startTx: Mikrofon-Berechtigung fehlt');
-        _setError(Platform.isWindows
-            ? 'Mikrofon gesperrt (Windows-Einstellungen › Datenschutz › Mikrofon)'
-            : 'Mikrofon-Berechtigung fehlt');
+        _setError(
+          Platform.isWindows
+              ? 'Mikrofon gesperrt (Windows-Einstellungen › Datenschutz › Mikrofon)'
+              : 'Mikrofon-Berechtigung fehlt',
+        );
         return;
       }
       if (token != _txToken) return;
@@ -1254,7 +1717,12 @@ class AudioEngine {
             )
             .timeout(const Duration(seconds: 5));
       } catch (e, st) {
-        AppLogger.error('AUDIO', 'startTx: Mikrofon konnte nicht gestartet werden: $e', e, st);
+        AppLogger.error(
+          'AUDIO',
+          'startTx: Mikrofon konnte nicht gestartet werden: $e',
+          e,
+          st,
+        );
         var devices = <InputDevice>[];
         try {
           devices = await _rec.listInputDevices().timeout(
@@ -1262,9 +1730,11 @@ class AudioEngine {
             onTimeout: () => <InputDevice>[],
           );
         } catch (_) {}
-        _setError(devices.isEmpty
-            ? 'Kein Mikrofon gefunden'
-            : 'Mikrofon konnte nicht gestartet werden: $e');
+        _setError(
+          devices.isEmpty
+              ? 'Kein Mikrofon gefunden'
+              : 'Mikrofon konnte nicht gestartet werden: $e',
+        );
         return;
       }
 
@@ -1311,7 +1781,10 @@ class AudioEngine {
     final had = _txActive;
     final wasParrot = _txParrot;
     _txActive = false; // ab sofort keine Mikrofon-Daten mehr senden
-    AppLogger.info('AUDIO', 'stopTx: PTT losgelassen (hatte gesendet: $had, Papagei: $wasParrot)');
+    AppLogger.info(
+      'AUDIO',
+      'stopTx: PTT losgelassen (hatte gesendet: $had, Papagei: $wasParrot)',
+    );
     return _enqueueMic(() => _stopTxImpl(token, had, wasParrot));
   }
 
@@ -1324,9 +1797,10 @@ class AudioEngine {
 
     // isRecording() / stop() können auf fehlerhaften Windows-Treibern werfen → Timeouts
     try {
-      final recording = await _rec
-          .isRecording()
-          .timeout(const Duration(seconds: 2), onTimeout: () => false);
+      final recording = await _rec.isRecording().timeout(
+        const Duration(seconds: 2),
+        onTimeout: () => false,
+      );
       if (recording) {
         await _rec.stop().timeout(const Duration(seconds: 3));
       }
@@ -1408,6 +1882,10 @@ class AudioEngine {
       await _ctlSub?.cancel();
     } catch (_) {}
     try {
+      await _deviceStartFailureSub?.cancel();
+    } catch (_) {}
+    _deviceStartFailureSub = null;
+    try {
       await stopTx().timeout(const Duration(seconds: 2));
     } catch (_) {}
     try {
@@ -1426,12 +1904,16 @@ class AudioEngine {
     if (SoLoud.instance.isInitialized) {
       if (handle != null) {
         try {
-          await SoLoud.instance.stop(handle).timeout(const Duration(milliseconds: 500));
+          await SoLoud.instance
+              .stop(handle)
+              .timeout(const Duration(milliseconds: 500));
         } catch (_) {}
       }
       if (output != null) {
         try {
-          await SoLoud.instance.disposeSource(output).timeout(const Duration(milliseconds: 500));
+          await SoLoud.instance
+              .disposeSource(output)
+              .timeout(const Duration(milliseconds: 500));
         } catch (_) {}
       }
     }

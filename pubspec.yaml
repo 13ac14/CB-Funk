@@ -1,10 +1,11 @@
 name: cb_funk
 description: CB-Funk - CB-Funkgeraet als App (MQTT-VoIP)
 publish_to: "none"
-version: 1.3.0+30
+version: 1.4.7+39
 
 environment:
-  sdk: ">=3.3.0 <4.0.0"
+  sdk: ">=3.11.0 <4.0.0"
+  flutter: ">=3.41.0"
 
 dependencies:
   flutter:
@@ -15,11 +16,13 @@ dependencies:
   shared_preferences: ^2.2.3
   path_provider: ^2.1.0   # Ablageort der Einstellungen (Reparatur bei defekter Datei)
   record: ^6.2.0          # Mikrofon (PCM-Stream), Android + Windows
-  flutter_soloud: ^3.1.0  # Wiedergabe von PCM-Stream, Android + Windows
+  flutter_soloud: ^5.2.3  # PCM-Wiedergabe + stabiler Audio-Geräte-Lifecycle
   ffi: ^2.1.0             # Windows: serielle Leitung + USB-HID per Win32
   usb_serial: ^0.5.2      # Android: USB-Seriell (RTS/DTR)
   wakelock_plus: ^1.2.8   # Bildschirm/PC bei aktivem Gateway wach halten
-
+  flutter_map: ^8.3.2     # Windows-Live-Karte
+  latlong2: ^0.9.1
+  geolocator: ^14.0.2     # Windows-Standortfreigabe
 dev_dependencies:
   flutter_test:
     sdk: flutter

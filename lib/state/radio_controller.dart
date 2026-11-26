@@ -1,13 +1,17 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' show AppExitResponse;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../audio/audio_engine.dart';
+import '../audio/audio_packet.dart';
+import '../config/app_config.dart';
 import '../data/cb_channels.dart';
 import '../gateway/ptt_driver.dart';
 import '../models/enums.dart';
@@ -26,7 +30,10 @@ class RadioController extends ChangeNotifier
     audio = AudioEngine(mqtt, this)
       ..onLevel = _onLevel
       ..onStatus = _changed
-      ..onScanHit = _onScanHit;
+      ..onScanHit = _onScanHit
+      ..onDigitalSamples = (frame) {
+        if (!_digitalSamples.isClosed) _digitalSamples.add(frame);
+      };
     HardwareKeyboard.instance.addHandler(_handleKey);
     _watchdogTimer = Timer.periodic(
       Duration(
@@ -55,30 +62,62 @@ class RadioController extends ChangeNotifier
   Timer? _watchdogTimer;
   bool _watchdogRunning = false;
   final ValueNotifier<double> sMeterListenable = ValueNotifier<double>(0);
+  final StreamController<DigitalPcmFrame> _digitalSamples =
+      StreamController<DigitalPcmFrame>.broadcast();
+  Stream<DigitalPcmFrame> get digitalPcmStream => _digitalSamples.stream;
+  bool _digitalTransmitActive = false;
+  int _digitalTransmitToken = 0;
+  Completer<void>? _digitalTransmitCancelled;
+  double _smoothedSMeter = 0;
   double _lastPublishedSMeter = 0;
+  bool _rxIndicator = false;
+  bool _lastPublishedRxIndicator = false;
   DateTime _lastSMeterPublish = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   int get antennaDb => antenna.db;
   String? get audioError => audio.error;
   int get stationsOnChannel => mqtt.stationCount;
+  bool get rxIndicator => _rxIndicator;
 
   void _onLevel(double v) {
-    sMeter = v;
+    final level = v.clamp(0.0, 1.0).toDouble();
+    final smoothing = level > _smoothedSMeter ? 0.45 : 0.14;
+    _smoothedSMeter += (level - _smoothedSMeter) * smoothing;
+    if (_smoothedSMeter < 0.005) _smoothedSMeter = 0;
+    sMeter = _smoothedSMeter;
+
+    if (!_rxIndicator && sMeter >= 0.08) {
+      _rxIndicator = true;
+    } else if (_rxIndicator && sMeter <= 0.035) {
+      _rxIndicator = false;
+    }
+
     final oldStep = (_lastPublishedSMeter * 13).round();
-    final newStep = (v * 13).round();
-    final rxChanged = (v > 0.05) != (_lastPublishedSMeter > 0.05);
+    final newStep = (sMeter * 13).round();
+    final rxChanged = _rxIndicator != _lastPublishedRxIndicator;
     if (oldStep == newStep && !rxChanged) return;
 
     final now = DateTime.now();
-    final isSilent = v <= 0.001;
+    final isSilent = sMeter <= 0.001;
     if (!isSilent &&
         now.difference(_lastSMeterPublish) < const Duration(milliseconds: 80)) {
       return;
     }
-    _lastPublishedSMeter = v;
+    _lastPublishedSMeter = sMeter;
+    _lastPublishedRxIndicator = _rxIndicator;
     _lastSMeterPublish = now;
-    sMeterListenable.value = v;
+    sMeterListenable.value = sMeter;
+  }
+
+  void _resetSMeter() {
+    _smoothedSMeter = 0;
+    sMeter = 0;
+    _rxIndicator = false;
+    _lastPublishedSMeter = 0;
+    _lastPublishedRxIndicator = false;
+    _lastSMeterPublish = DateTime.now();
+    sMeterListenable.value = 0;
   }
 
   @override
@@ -129,6 +168,13 @@ class RadioController extends ChangeNotifier
   String callSign = '';
   @override
   bool realisticRange = false;
+  bool shareLocation = false;
+  bool preciseLocation = false;
+  String locationStatus = 'Standortfreigabe aus';
+  double? _latitude;
+  double? _longitude;
+  bool _locationRequestInProgress = false;
+  Timer? _locationTimer;
   @override
   bool gatewayEnabled = false;
   @override
@@ -156,13 +202,23 @@ class RadioController extends ChangeNotifier
   String gwHidKey = '';
   int gwHidGpio = 3;
   String gwInputId = '';
+  @override
+  String gwOutputId = '';
 
   bool get externalMicActive => false;
+  bool get digitalTransmitActive => _digitalTransmitActive;
   String get micLabel =>
       externalMicActive ? 'Externes Mikrofon' : 'Eingebautes Mikrofon';
 
   /// Zweite Statuszeile unter dem Display
   String get statusDetail {
+    // TX/PTT feedback must remain visible even if a previous RX warning is
+    // still being cleared by the audio output watchdog.
+    if (transmitting) {
+      return digitalTransmitActive
+          ? 'Digitalsignal wird über Kanal $channel gesendet'
+          : 'Senden · Mikrofon: $micLabel';
+    }
     final e = audio.error;
     if (e != null) return e;
     if (gatewayEnabled) {
@@ -173,7 +229,7 @@ class RadioController extends ChangeNotifier
       return 'Papagei: PTT halten, sprechen, loslassen – du hörst dich selbst · '
           'Sendepegel ${(audio.txGain * 100).round()} % (◄► regelt)';
     }
-    return '${sMeter > 0.05 ? 'Signal' : 'Band ruhig'} · $micLabel';
+    return '${rxIndicator ? 'Signal empfangen' : 'Band ruhig'} · Funknetz';
   }
 
   /// Clarifier nur bei SSB aktiv (bei FM/AM ausgegraut).
@@ -205,6 +261,7 @@ class RadioController extends ChangeNotifier
   /// Einstellungen sichern, bevor der Prozess endet.
   @override
   Future<AppExitResponse> didRequestAppExit() async {
+    cancelDigitalTransmission();
     try {
       await prepareForExit().timeout(const Duration(seconds: 2));
     } catch (_) {}
@@ -212,7 +269,10 @@ class RadioController extends ChangeNotifier
   }
 
   Future<void> prepareForExit() async {
-    AppLogger.info('APP', 'Beenden angefordert: Sendung stoppen, Einstellungen sichern');
+    AppLogger.info(
+      'APP',
+      'Beenden angefordert: Sendung stoppen, Einstellungen sichern',
+    );
     if (transmitting) pttUp();
     if (gatewayEnabled) {
       try {
@@ -244,7 +304,9 @@ class RadioController extends ChangeNotifier
           'WATCHDOG',
           'MQTT nicht online (transportConnected: ${mqtt.transportConnected}, state: ${mqtt.state}), veranlasse Reconnect...',
         );
-        await mqtt.reconnectIfDisconnected().timeout(const Duration(seconds: 12));
+        await mqtt.reconnectIfDisconnected().timeout(
+          const Duration(seconds: 12),
+        );
       }
       if (power && audio.needsOutputRecovery) {
         AppLogger.warn('WATCHDOG', 'Audio-Ausgabe erfordert Wiederherstellung');
@@ -330,15 +392,25 @@ class RadioController extends ChangeNotifier
     if (!Platform.isWindows) return null;
     try {
       final dir = await getApplicationSupportDirectory();
-      final f = File('${dir.path}${Platform.pathSeparator}shared_preferences.json');
+      final f = File(
+        '${dir.path}${Platform.pathSeparator}shared_preferences.json',
+      );
       if (await f.exists()) {
         final backup = '${f.path}.defekt';
         await f.rename(backup);
-        AppLogger.warn('SETTINGS', 'Defekte Einstellungsdatei gesichert als $backup, starte mit Standardwerten');
+        AppLogger.warn(
+          'SETTINGS',
+          'Defekte Einstellungsdatei gesichert als $backup, starte mit Standardwerten',
+        );
       }
       return await SharedPreferences.getInstance();
     } catch (e, st) {
-      AppLogger.error('SETTINGS', 'Einstellungen konnten nicht repariert werden: $e', e, st);
+      AppLogger.error(
+        'SETTINGS',
+        'Einstellungen konnten nicht repariert werden: $e',
+        e,
+        st,
+      );
       return null;
     }
   }
@@ -350,36 +422,51 @@ class RadioController extends ChangeNotifier
       return;
     }
 
-    antenna = Antenna
-        .values[(_readPreference<int>(p, 'antenna', antenna.index)).clamp(
-      0,
-      Antenna.values.length - 1,
-    )];
-    gatewayMode = GatewayMode.values[(_readPreference<int>(
-      p,
-      'gatewayMode',
-      gatewayMode.index,
-    )).clamp(
-      0,
-      GatewayMode.values.length - 1,
-    )];
+    antenna =
+        Antenna.values[(_readPreference<int>(
+          p,
+          'antenna',
+          antenna.index,
+        )).clamp(0, Antenna.values.length - 1)];
+    gatewayMode =
+        GatewayMode.values[(_readPreference<int>(
+          p,
+          'gatewayMode',
+          gatewayMode.index,
+        )).clamp(0, GatewayMode.values.length - 1)];
     gatewayEnabled = _readPreference<bool>(p, 'gatewayEnabled', false);
-    toggleInsteadOfHold =
-        _readPreference<bool>(p, 'toggleInsteadOfHold', false);
+    toggleInsteadOfHold = _readPreference<bool>(
+      p,
+      'toggleInsteadOfHold',
+      false,
+    );
     headsetButtonPtt = _readPreference<bool>(p, 'headsetButtonPtt', true);
     volumeDownPtt = _readPreference<bool>(p, 'volumeDownPtt', false);
     preferExternalMic = _readPreference<bool>(p, 'preferExternalMic', true);
     beepMode = _readPreference<int>(p, 'beepMode', 1).clamp(0, 5);
     parrot = _readPreference<bool>(p, 'parrot', false);
-    callSign = _readPreference<String>(p, 'callSign', '');
+    callSign = _readPreference<String>(p, 'callSign', '').trim().toUpperCase();
+    mqtt.localCallSign = callSign;
     realisticRange = _readPreference<bool>(p, 'realisticRange', false);
-    gwVoxThreshold =
-        _readPreference<double>(p, 'gwVox', 0.35).clamp(0.05, 0.9).toDouble();
+    shareLocation =
+        Platform.isWindows && _readPreference<bool>(p, 'shareLocation', false);
+    preciseLocation = _readPreference<bool>(p, 'preciseLocation', false);
+    gwVoxThreshold = _readPreference<double>(
+      p,
+      'gwVox',
+      0.35,
+    ).clamp(0.05, 0.9).toDouble();
     gwHangMs = _readPreference<int>(p, 'gwHang', 700).clamp(200, 1500);
-    gwInGain =
-        _readPreference<double>(p, 'gwIn', 1.0).clamp(0.25, 4.0).toDouble();
-    gwOutGain =
-        _readPreference<double>(p, 'gwOut', 1.0).clamp(0.25, 2.0).toDouble();
+    gwInGain = _readPreference<double>(
+      p,
+      'gwIn',
+      1.0,
+    ).clamp(0.25, 4.0).toDouble();
+    gwOutGain = _readPreference<double>(
+      p,
+      'gwOut',
+      1.0,
+    ).clamp(0.25, 2.0).toDouble();
     gwPreMs = _readPreference<int>(p, 'gwPre', 200).clamp(0, 800);
     gwPostMs = _readPreference<int>(p, 'gwPost', 300).clamp(100, 800);
     gwSerialPort = _readPreference<String>(p, 'gwSerial', '');
@@ -387,29 +474,49 @@ class RadioController extends ChangeNotifier
     gwHidKey = _readPreference<String>(p, 'gwHid', '');
     gwHidGpio = _readPreference<int>(p, 'gwGpio', 3).clamp(1, 4);
     gwInputId = _readPreference<String>(p, 'gwInput', '');
+    if (Platform.isWindows) {
+      gwOutputId = _readPreference<String>(p, 'gwOutput', '');
+    }
     for (final a in KeyAction.values) {
       final id = _readPreference<int?>(p, 'key_${a.name}', null);
       if (id != null) keys.set(a, id);
     }
-    channel =
-        _readPreference<int>(p, 'channel', channel).clamp(1, CbChannels.count);
-    modulation = Modulation.values[(_readPreference<int>(p, 'mod', 0)).clamp(
-      0,
-      Modulation.values.length - 1,
-    )];
-    volume =
-        _readPreference<double>(p, 'volume', volume).clamp(0.0, 1.0).toDouble();
-    squelch = _readPreference<double>(p, 'squelch', squelch)
-        .clamp(0.0, 1.0)
-        .toDouble();
-    rfGain =
-        _readPreference<double>(p, 'rfGain', rfGain).clamp(0.0, 1.0).toDouble();
-    clarifier = _readPreference<double>(p, 'clarifier', clarifier)
-        .clamp(0.0, 1.0)
-        .toDouble();
-    txLevel = _readPreference<double>(p, 'txLevel', txLevel)
-        .clamp(0.0, 1.0)
-        .toDouble();
+    channel = _readPreference<int>(
+      p,
+      'channel',
+      channel,
+    ).clamp(1, CbChannels.count);
+    modulation =
+        Modulation.values[(_readPreference<int>(
+          p,
+          'mod',
+          0,
+        )).clamp(0, Modulation.values.length - 1)];
+    volume = _readPreference<double>(
+      p,
+      'volume',
+      volume,
+    ).clamp(0.0, 1.0).toDouble();
+    squelch = _readPreference<double>(
+      p,
+      'squelch',
+      squelch,
+    ).clamp(0.0, 1.0).toDouble();
+    rfGain = _readPreference<double>(
+      p,
+      'rfGain',
+      rfGain,
+    ).clamp(0.0, 1.0).toDouble();
+    clarifier = _readPreference<double>(
+      p,
+      'clarifier',
+      clarifier,
+    ).clamp(0.0, 1.0).toDouble();
+    txLevel = _readPreference<double>(
+      p,
+      'txLevel',
+      txLevel,
+    ).clamp(0.0, 1.0).toDouble();
     audio.txGain = 0.5 + txLevel;
     micSensitivity = _readPreference<double>(
       p,
@@ -428,9 +535,16 @@ class RadioController extends ChangeNotifier
       _enforceGateway();
       _changed();
       unawaited(_setBackgroundAudio(power));
+      if (Platform.isWindows) unawaited(_applyGatewayOutputDevice());
+      if (shareLocation) _startLocationUpdates();
       if (gatewayEnabled) _queueGateway();
     } catch (e, st) {
-      AppLogger.error('SETTINGS', 'Fehler in _finishLoadingSettings: $e', e, st);
+      AppLogger.error(
+        'SETTINGS',
+        'Fehler in _finishLoadingSettings: $e',
+        e,
+        st,
+      );
     }
   }
 
@@ -452,40 +566,43 @@ class RadioController extends ChangeNotifier
   }
 
   Map<String, Object?> _settingsSnapshot() => <String, Object?>{
-        'antenna': antenna.index,
-        'gatewayMode': gatewayMode.index,
-        'gatewayEnabled': gatewayEnabled,
-        'toggleInsteadOfHold': toggleInsteadOfHold,
-        'headsetButtonPtt': headsetButtonPtt,
-        'volumeDownPtt': volumeDownPtt,
-        'preferExternalMic': preferExternalMic,
-        'beepMode': beepMode,
-        'parrot': parrot,
-        'callSign': callSign,
-        'realisticRange': realisticRange,
-        'channel': channel,
-        'mod': modulation.index,
-        'volume': volume,
-        'squelch': squelch,
-        'rfGain': rfGain,
-        'clarifier': clarifier,
-        'txLevel': txLevel,
-        'micSensitivity': micSensitivity,
-        'echo': echo,
-        'nb': noiseBlanker,
-        'gwVox': gwVoxThreshold,
-        'gwHang': gwHangMs,
-        'gwIn': gwInGain,
-        'gwOut': gwOutGain,
-        'gwPre': gwPreMs,
-        'gwPost': gwPostMs,
-        'gwSerial': gwSerialPort,
-        'gwDtr': gwUseDtr,
-        'gwHid': gwHidKey,
-        'gwGpio': gwHidGpio,
-        'gwInput': gwInputId,
-        for (final a in KeyAction.values) 'key_${a.name}': keys.idFor(a),
-      };
+    'antenna': antenna.index,
+    'gatewayMode': gatewayMode.index,
+    'gatewayEnabled': gatewayEnabled,
+    'toggleInsteadOfHold': toggleInsteadOfHold,
+    'headsetButtonPtt': headsetButtonPtt,
+    'volumeDownPtt': volumeDownPtt,
+    'preferExternalMic': preferExternalMic,
+    'beepMode': beepMode,
+    'parrot': parrot,
+    'callSign': callSign,
+    'realisticRange': realisticRange,
+    if (Platform.isWindows) 'shareLocation': shareLocation,
+    if (Platform.isWindows) 'preciseLocation': preciseLocation,
+    'channel': channel,
+    'mod': modulation.index,
+    'volume': volume,
+    'squelch': squelch,
+    'rfGain': rfGain,
+    'clarifier': clarifier,
+    'txLevel': txLevel,
+    'micSensitivity': micSensitivity,
+    'echo': echo,
+    'nb': noiseBlanker,
+    'gwVox': gwVoxThreshold,
+    'gwHang': gwHangMs,
+    'gwIn': gwInGain,
+    'gwOut': gwOutGain,
+    'gwPre': gwPreMs,
+    'gwPost': gwPostMs,
+    'gwSerial': gwSerialPort,
+    'gwDtr': gwUseDtr,
+    'gwHid': gwHidKey,
+    'gwGpio': gwHidGpio,
+    'gwInput': gwInputId,
+    if (Platform.isWindows) 'gwOutput': gwOutputId,
+    for (final a in KeyAction.values) 'key_${a.name}': keys.idFor(a),
+  };
 
   Future<void> _writeSettings() async {
     try {
@@ -525,13 +642,149 @@ class RadioController extends ChangeNotifier
 
   void setCallSign(String value) {
     callSign = value.trim().toUpperCase();
+    mqtt.localCallSign = callSign;
     _saveSoon();
+    _changed();
   }
 
   void setRealisticRange(bool value) {
     realisticRange = value;
     _save();
     _changed();
+  }
+
+  void setShareLocation(bool value) {
+    if (!Platform.isWindows || shareLocation == value) return;
+    shareLocation = value;
+    _save();
+    if (shareLocation) {
+      locationStatus = 'Standort wird ermittelt …';
+      _startLocationUpdates();
+    } else {
+      _locationTimer?.cancel();
+      _locationTimer = null;
+      _latitude = null;
+      _longitude = null;
+      locationStatus = 'Standortfreigabe aus';
+      mqtt.setLocationCoordinates(
+        latitude: null,
+        longitude: null,
+        precise: preciseLocation,
+        enabled: false,
+      );
+    }
+    _changed();
+  }
+
+  void setPreciseLocation(bool value) {
+    if (!Platform.isWindows || preciseLocation == value) return;
+    preciseLocation = value;
+    _save();
+    if (shareLocation) {
+      _publishLocation();
+      locationStatus = value
+          ? 'Genauer Standort wird freigegeben'
+          : 'Ungefährer Standort (auf etwa 1 km gerundet)';
+    }
+    _changed();
+  }
+
+  void _startLocationUpdates() {
+    _locationTimer?.cancel();
+    mqtt.setLocationCoordinates(
+      latitude: _latitude,
+      longitude: _longitude,
+      precise: preciseLocation,
+      enabled: true,
+    );
+    unawaited(_refreshLocation());
+    _locationTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => unawaited(_refreshLocation()),
+    );
+  }
+
+  Future<void> _refreshLocation() async {
+    if (!shareLocation || _locationRequestInProgress) return;
+    _locationRequestInProgress = true;
+    try {
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (!shareLocation) return;
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        _latitude = null;
+        _longitude = null;
+        locationStatus = permission == LocationPermission.deniedForever
+            ? 'Standortzugriff in den Windows-Einstellungen dauerhaft verweigert'
+            : 'Windows-Standortzugriff nicht erteilt';
+        mqtt.setLocationCoordinates(
+          latitude: null,
+          longitude: null,
+          precise: preciseLocation,
+          enabled: shareLocation,
+        );
+        _changed();
+        return;
+      }
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: LocationSettings(
+          accuracy: preciseLocation
+              ? LocationAccuracy.best
+              : LocationAccuracy.low,
+          timeLimit: const Duration(seconds: 15),
+        ),
+      );
+      if (!shareLocation) return;
+      _latitude = position.latitude;
+      _longitude = position.longitude;
+      _publishLocation();
+      locationStatus = preciseLocation
+          ? 'Genauer Standort wird freigegeben'
+          : 'Ungefährer Standort (auf etwa 1 km gerundet)';
+      _changed();
+    } on LocationServiceDisabledException catch (e) {
+      AppLogger.warn(
+        'LOCATION',
+        'Windows-Standortdienste sind deaktiviert: $e',
+      );
+      locationStatus = 'Windows-Standortdienste sind deaktiviert';
+      mqtt.setLocationCoordinates(
+        latitude: null,
+        longitude: null,
+        precise: preciseLocation,
+        enabled: shareLocation,
+      );
+      _changed();
+    } catch (e, st) {
+      AppLogger.error(
+        'LOCATION',
+        'Standort konnte nicht ermittelt werden: $e',
+        e,
+        st,
+      );
+      locationStatus = 'Standort konnte nicht ermittelt werden';
+      mqtt.setLocationCoordinates(
+        latitude: null,
+        longitude: null,
+        precise: preciseLocation,
+        enabled: shareLocation,
+      );
+      _changed();
+    } finally {
+      _locationRequestInProgress = false;
+    }
+  }
+
+  void _publishLocation() {
+    mqtt.setLocationCoordinates(
+      latitude: _latitude,
+      longitude: _longitude,
+      precise: preciseLocation,
+      enabled: shareLocation,
+    );
   }
 
   void setTxLevel(double value) {
@@ -568,7 +821,10 @@ class RadioController extends ChangeNotifier
   bool setGatewayEnabled(bool v) {
     if (v && !gatewayAllowed) return false;
     gatewayEnabled = v;
-    AppLogger.info('GATEWAY', 'Gateway aktiviert: $v (Modus: ${gatewayMode.name})');
+    AppLogger.info(
+      'GATEWAY',
+      'Gateway aktiviert: $v (Modus: ${gatewayMode.name})',
+    );
     _save();
     _changed();
     _queueGateway();
@@ -628,6 +884,7 @@ class RadioController extends ChangeNotifier
 
   // ---------- Bedienung ----------
   void togglePower() {
+    if (power) cancelDigitalTransmission();
     power = !power;
     AppLogger.info('RADIO', 'Power umgeschaltet: ${power ? "EIN" : "AUS"}');
     if (!power) {
@@ -638,12 +895,13 @@ class RadioController extends ChangeNotifier
       _stopScan();
       parrot = false;
       audio.flush();
-      sMeter = 0;
-      _onLevel(0);
+      _resetSMeter();
       mqtt.disconnect();
     } else {
       _watchdogTimer ??= Timer.periodic(
-        Duration(seconds: defaultTargetPlatform == TargetPlatform.windows ? 3 : 15),
+        Duration(
+          seconds: defaultTargetPlatform == TargetPlatform.windows ? 3 : 15,
+        ),
         (_) => unawaited(_runWatchdog()),
       );
       mqtt.connect();
@@ -656,6 +914,7 @@ class RadioController extends ChangeNotifier
 
   void setChannel(int ch) {
     if (!power) return;
+    cancelDigitalTransmission();
     if (scanning) _stopScan(); // Kanaltaste beendet den Suchlauf
     final old = channel;
     channel =
@@ -788,12 +1047,20 @@ class RadioController extends ChangeNotifier
       if (d != null) {
         try {
           await d.open().timeout(const Duration(seconds: 3));
-          AppLogger.info('GATEWAY', 'PTT-Treiber geöffnet (${gatewayMode.name})');
+          AppLogger.info(
+            'GATEWAY',
+            'PTT-Treiber geöffnet (${gatewayMode.name})',
+          );
           _ptt = d;
           audio.ptt = d;
           audio.setError(null);
         } catch (e, st) {
-          AppLogger.error('GATEWAY', 'Fehler beim Öffnen des PTT-Treibers: $e', e, st);
+          AppLogger.error(
+            'GATEWAY',
+            'Fehler beim Öffnen des PTT-Treibers: $e',
+            e,
+            st,
+          );
           audio.setError('Gateway: $e');
         }
       }
@@ -802,9 +1069,16 @@ class RadioController extends ChangeNotifier
     }
 
     try {
-      await audio.startGateway(inputId: gwInputId).timeout(const Duration(seconds: 6));
+      await audio
+          .startGateway(inputId: gwInputId)
+          .timeout(const Duration(seconds: 6));
     } catch (e, st) {
-      AppLogger.error('GATEWAY', 'Fehler beim Starten von audio.startGateway: $e', e, st);
+      AppLogger.error(
+        'GATEWAY',
+        'Fehler beim Starten von audio.startGateway: $e',
+        e,
+        st,
+      );
       audio.setError('Gateway-Audio: $e');
     }
     _changed();
@@ -836,7 +1110,8 @@ class RadioController extends ChangeNotifier
     if (hidGpio != null) gwHidGpio = hidGpio;
     if (inputId != null) gwInputId = inputId;
     if (save) _save();
-    final restart = serialPort != null ||
+    final restart =
+        serialPort != null ||
         useDtr != null ||
         hidKey != null ||
         hidGpio != null ||
@@ -845,7 +1120,31 @@ class RadioController extends ChangeNotifier
     _changed();
   }
 
-  void saveSettings() => _save();
+  Future<void> saveSettings() => _save();
+
+  Future<void> setGatewayOutputDevice(String deviceId) async {
+    if (gwOutputId == deviceId) return;
+    gwOutputId = deviceId;
+    _changed();
+    final applying = _applyGatewayOutputDevice();
+    await _save();
+    await applying;
+  }
+
+  Future<void> _applyGatewayOutputDevice() async {
+    try {
+      await audio.changeOutputDevice(gwOutputId);
+    } catch (e, st) {
+      AppLogger.error(
+        'AUDIO',
+        'Ausgewähltes Windows-Ausgabegerät konnte nicht aktiviert werden',
+        e,
+        st,
+      );
+      audio.setError('Audio-Ausgang: $e');
+    }
+  }
+
   void gatewayTest() => audio.gatewayTest();
 
   // ---------- Papagei ----------
@@ -918,11 +1217,12 @@ class RadioController extends ChangeNotifier
   }
 
   void pttDown() {
-    if (!power || transmitting || gatewayEnabled) return;
+    if (!power || transmitting || gatewayEnabled || _digitalTransmitActive) {
+      return;
+    }
     if (scanning) _stopScan();
     transmitting = true;
-    sMeter = 0;
-    _onLevel(0);
+    _resetSMeter();
     audio.flush();
     if (!parrot) mqtt.publishPtt(channel, true, antenna.db);
     _changed();
@@ -930,10 +1230,100 @@ class RadioController extends ChangeNotifier
   }
 
   void pttUp() {
-    if (!transmitting) return;
+    if (!transmitting || _digitalTransmitActive) return;
     transmitting = false;
     audio.stopTx();
     if (!parrot) mqtt.publishPtt(channel, false, antenna.db);
+    _changed();
+  }
+
+  Future<void> transmitDigitalAudio({
+    required int mode,
+    required int requiredChannel,
+    required Stream<Int16List> frames,
+  }) async {
+    final expectedMode = AudioPacket.digitalModulationForChannel(
+      requiredChannel,
+    );
+    if (expectedMode == null || mode != expectedMode) {
+      throw ArgumentError('Unbekannter Digitalmodus oder Kanal');
+    }
+    if (!power || channel != requiredChannel) {
+      throw StateError('Digitalfunk ist nur auf Kanal $requiredChannel aktiv');
+    }
+    if (transmitting || _digitalTransmitActive) {
+      throw StateError('Es läuft bereits eine Sendung');
+    }
+    if (mqtt.state != LinkState.online) {
+      throw StateError('Keine MQTT-Verbindung – Senden nicht möglich');
+    }
+
+    final token = ++_digitalTransmitToken;
+    final cancelled = Completer<void>();
+    _digitalTransmitCancelled = cancelled;
+    _digitalTransmitActive = true;
+    transmitting = true;
+    audio.flush();
+    mqtt.publishPtt(channel, true, antenna.db);
+    _changed();
+    var sequence = 0;
+    final iterator = StreamIterator<Int16List>(frames);
+    try {
+      while (token == _digitalTransmitToken) {
+        final hasFrame = await Future.any<bool>([
+          iterator.moveNext(),
+          cancelled.future.then((_) => false),
+        ]);
+        if (!hasFrame || token != _digitalTransmitToken) break;
+        final samples = iterator.current;
+        if (samples.isEmpty || samples.length > AppConfig.frameSamples) {
+          throw StateError('Ungültige Audio-Framegröße: ${samples.length}');
+        }
+        final packet = AudioPacket(
+          sender: mqtt.senderId,
+          channel: requiredChannel,
+          modulation: mode,
+          antennaDb: antenna.db,
+          seq: sequence++ & 0xffff,
+          payload: AudioPacket.encodeLinearPcm(samples),
+        );
+        audio.queueDigitalTxSamples(
+          channel: requiredChannel,
+          modulation: mode,
+          samples: samples,
+        );
+        mqtt.publishAudio(packet.toBytes());
+        await Future<void>.delayed(
+          Duration(
+            milliseconds: (samples.length * 1000 / AppConfig.audioRate).round(),
+          ),
+        );
+      }
+      if (token != _digitalTransmitToken) {
+        throw StateError('Digitalsendung abgebrochen');
+      }
+    } finally {
+      await iterator.cancel();
+      if (token == _digitalTransmitToken) {
+        _digitalTransmitActive = false;
+        _digitalTransmitCancelled = null;
+        transmitting = false;
+        mqtt.publishPtt(requiredChannel, false, antenna.db);
+        _changed();
+      }
+    }
+  }
+
+  void cancelDigitalTransmission() {
+    if (!_digitalTransmitActive) return;
+    final channelBeingSent = channel;
+    _digitalTransmitToken++;
+    _digitalTransmitActive = false;
+    transmitting = false;
+    mqtt.publishPtt(channelBeingSent, false, antenna.db);
+    final cancelled = _digitalTransmitCancelled;
+    _digitalTransmitCancelled = null;
+    if (cancelled != null && !cancelled.isCompleted) cancelled.complete();
     _changed();
   }
 
@@ -1022,7 +1412,8 @@ class RadioController extends ChangeNotifier
       return true;
     }
 
-    final isHeadset = k == LogicalKeyboardKey.headsetHook ||
+    final isHeadset =
+        k == LogicalKeyboardKey.headsetHook ||
         k == LogicalKeyboardKey.mediaPlayPause;
     if ((headsetButtonPtt && isHeadset) ||
         (volumeDownPtt && k == LogicalKeyboardKey.audioVolumeDown)) {
@@ -1075,13 +1466,16 @@ class RadioController extends ChangeNotifier
   @override
   void dispose() {
     AppLogger.info('RADIO', 'RadioController dispose() aufgerufen');
+    cancelDigitalTransmission();
     WidgetsBinding.instance.removeObserver(this);
     unawaited(_setBackgroundAudio(false));
     _watchdogTimer?.cancel();
     _scanTimer?.cancel();
     _saveTimer?.cancel();
+    _locationTimer?.cancel();
     HardwareKeyboard.instance.removeHandler(_handleKey);
     audio.dispose();
+    _digitalSamples.close();
     mqtt.removeListener(notifyListeners);
     sMeterListenable.dispose();
     AppLogger.close();

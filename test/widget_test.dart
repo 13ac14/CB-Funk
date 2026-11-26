@@ -3,6 +3,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:cb_funk/audio/audio_packet.dart';
 import 'package:cb_funk/audio/mulaw.dart';
 import 'package:cb_funk/data/cb_channels.dart';
+import 'package:cb_funk/services/location_privacy.dart';
+import 'package:cb_funk/services/map_station_registry.dart';
 
 void main() {
   test('Kanaltabelle: 80 Kanaele, Kanal 11 = 27.085 MHz', () {
@@ -12,11 +14,134 @@ void main() {
     expect(CbChannels.frequency(41), closeTo(26.565, 0.0001));
   });
 
+  test('Standortfreigabe rundet ungefaehre Koordinaten, genaue nicht', () {
+    expect(LocationPrivacy.shareCoordinate(52.5234, precise: false), 52.52);
+    expect(LocationPrivacy.shareCoordinate(13.4122, precise: false), 13.41);
+    expect(LocationPrivacy.shareCoordinate(52.5234, precise: true), 52.5234);
+  });
+
+  test(
+    'Kartenstation behaelt Koordinaten bei Kontrollpaketen ohne Standort',
+    () {
+      final registry = MapStationRegistry();
+      final now = DateTime(2026, 11, 23);
+      registry.update({
+        'sid': 42,
+        'ch': 11,
+        'callsign': 'DO5VH',
+        'lat': 52.52,
+        'lon': 13.41,
+        'loc': true,
+      }, now: now);
+      registry.update({
+        'sid': 42,
+        'ch': 19,
+        'callsign': 'DO5VH',
+        'ptt': true,
+        'loc': true,
+      }, now: now.add(const Duration(seconds: 30)));
+
+      final station = registry.stations(
+        now: now.add(const Duration(seconds: 30)),
+      );
+      expect(station, hasLength(1));
+      expect(station.single.callSign, 'DO5VH');
+      expect(station.single.channel, 19);
+      expect(station.single.latitude, 52.52);
+      expect(station.single.longitude, 13.41);
+    },
+  );
+
+  test('Kartenstation wird nach explizitem Standort-Ausschalten entfernt', () {
+    final registry = MapStationRegistry();
+    registry.update({
+      'sid': 42,
+      'ch': 11,
+      'callsign': 'DO5VH',
+      'lat': 52.52,
+      'lon': 13.41,
+    });
+    registry.update({'sid': 42, 'ch': 11, 'callsign': 'DO5VH', 'loc': false});
+
+    expect(registry.stations(), isEmpty);
+  });
+
+  test('TX-Status folgt MQTT-PTT und Heartbeat', () {
+    final registry = MapStationRegistry();
+    final now = DateTime(2026, 11, 23);
+    registry.update({
+      'sid': 42,
+      'ch': 11,
+      'callsign': 'DO5VH',
+      'lat': 52.52,
+      'lon': 13.41,
+      'tx': true,
+    }, now: now);
+    expect(registry.stations(now: now).single.transmitting, isTrue);
+
+    registry.update({
+      'sid': 42,
+      'ch': 11,
+      'callsign': 'DO5VH',
+      'hb': true,
+      'tx': false,
+    }, now: now.add(const Duration(seconds: 8)));
+    expect(
+      registry
+          .stations(now: now.add(const Duration(seconds: 8)))
+          .single
+          .transmitting,
+      isFalse,
+    );
+  });
+
+  test(
+    'Kartenstation bleibt waehrend Aktivitaet online und laeuft spaeter ab',
+    () {
+      final registry = MapStationRegistry();
+      final now = DateTime(2026, 11, 23);
+      registry.update({
+        'sid': 42,
+        'ch': 11,
+        'callsign': 'DO5VH',
+        'lat': 52.52,
+        'lon': 13.41,
+      }, now: now);
+      registry.update({
+        'sid': 42,
+        'ch': 11,
+        'callsign': 'DO5VH',
+        'hb': true,
+      }, now: now.add(const Duration(seconds: 90)));
+
+      expect(
+        registry.stations(now: now.add(const Duration(seconds: 180))),
+        hasLength(1),
+      );
+      expect(
+        registry.stations(now: now.add(const Duration(seconds: 211))),
+        isEmpty,
+      );
+      expect(
+        registry.update({
+          'sid': 42,
+          'ch': 11,
+          'callsign': 'DO5VH',
+          'hb': true,
+        }, now: now.add(const Duration(seconds: 211))),
+        isFalse,
+      );
+    },
+  );
+
   test('mu-law Rundlauf bleibt nahe am Original', () {
     for (final v in [-20000, -3000, -500, 0, 500, 3000, 20000]) {
       final back = MuLaw.decode(MuLaw.encode(v));
-      expect((back - v).abs() <= (v.abs() * 0.07 + 40), isTrue,
-          reason: 'v=$v back=$back');
+      expect(
+        (back - v).abs() <= (v.abs() * 0.07 + 40),
+        isTrue,
+        reason: 'v=$v back=$back',
+      );
     }
   });
 

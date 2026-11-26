@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../config/app_config.dart';
@@ -25,8 +27,11 @@ Future<void> showSettings(BuildContext context) async {
   r.dialogOpen = true;
   try {
     await showDialog<void>(
-        context: context, builder: (_) => const _SettingsDialog());
+      context: context,
+      builder: (_) => const _SettingsDialog(),
+    );
   } finally {
+    if (Platform.isWindows) await r.saveSettings();
     r.dialogOpen = false;
   }
 }
@@ -47,8 +52,9 @@ class _SettingsDialogState extends State<_SettingsDialog> {
   @override
   void initState() {
     super.initState();
-    _callSignController =
-        TextEditingController(text: context.read<RadioController>().callSign);
+    _callSignController = TextEditingController(
+      text: context.read<RadioController>().callSign,
+    );
     _sc.addListener(_scrollChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollChanged());
   }
@@ -86,120 +92,161 @@ class _SettingsDialogState extends State<_SettingsDialog> {
 
   // ---------- Bausteine ----------
   Widget _hint(String text, bool visible, VoidCallback onTap) => SizedBox(
-        height: 26,
-        child: visible
-            ? InkWell(
-                onTap: onTap,
-                child: Center(
-                  child: Text(text,
-                      style: const TextStyle(
-                          color: _amber, fontSize: 12.5, letterSpacing: 0.3)),
+    height: 26,
+    child: visible
+        ? InkWell(
+            onTap: onTap,
+            child: Center(
+              child: Text(
+                text,
+                style: const TextStyle(
+                  color: _amber,
+                  fontSize: 12.5,
+                  letterSpacing: 0.3,
                 ),
-              )
-            : null,
-      );
+              ),
+            ),
+          )
+        : null,
+  );
 
   Widget _heading(String t) => Padding(
-        padding: const EdgeInsets.only(top: 18, bottom: 8),
-        child: Text(t,
-            style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
-      );
+    padding: const EdgeInsets.only(top: 18, bottom: 8),
+    child: Text(
+      t,
+      style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+    ),
+  );
 
   Widget _small(String t, {Color color = CbColors.textDim}) => Padding(
-        padding: const EdgeInsets.only(bottom: 6),
-        child: Text(t,
-            style: TextStyle(fontSize: 13.5, color: color, height: 1.35)),
-      );
+    padding: const EdgeInsets.only(bottom: 6),
+    child: Text(
+      t,
+      style: TextStyle(fontSize: 13.5, color: color, height: 1.35),
+    ),
+  );
 
-  Widget _switchRow(String title, String? sub, bool value,
-          ValueChanged<bool> onChanged) =>
-      Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        child: Row(children: [
-          Expanded(
-            child:
-                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+  Widget _switchRow(
+    String title,
+    String? sub,
+    bool value,
+    ValueChanged<bool> onChanged,
+  ) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 8),
+    child: Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
               Text(title, style: const TextStyle(fontSize: 17)),
               if (sub != null)
                 Padding(
                   padding: const EdgeInsets.only(top: 3),
-                  child: Text(sub,
-                      style: const TextStyle(
-                          fontSize: 12.5,
-                          color: CbColors.textDim,
-                          height: 1.3)),
+                  child: Text(
+                    sub,
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      color: CbColors.textDim,
+                      height: 1.3,
+                    ),
+                  ),
                 ),
-            ]),
+            ],
           ),
-          const SizedBox(width: 10),
-          Switch(value: value, onChanged: onChanged),
-        ]),
-      );
+        ),
+        const SizedBox(width: 10),
+        Switch(value: value, onChanged: onChanged),
+      ],
+    ),
+  );
 
-  Widget _radioRow(
-          {required String label,
-          required bool selected,
-          required VoidCallback onTap,
-          VoidCallback? onHelp}) =>
-      InkWell(
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 9),
-          child: Row(children: [
-            Icon(
-                selected
-                    ? Icons.radio_button_checked
-                    : Icons.radio_button_unchecked,
-                size: 26,
-                color: selected ? _lilac : CbColors.textDim),
-            const SizedBox(width: 16),
-            Expanded(
-                child: Text(label,
-                    style: const TextStyle(fontSize: 16, height: 1.25))),
-            if (onHelp != null)
-              InkWell(
-                onTap: onHelp,
-                child: const Padding(
-                  padding: EdgeInsets.fromLTRB(14, 8, 8, 8),
-                  child: Text('?',
-                      style: TextStyle(
-                          color: _lilac,
-                          fontSize: 18,
-                          fontWeight: FontWeight.w700)),
+  Widget _radioRow({
+    required String label,
+    required bool selected,
+    required VoidCallback onTap,
+    VoidCallback? onHelp,
+  }) => InkWell(
+    onTap: onTap,
+    child: Padding(
+      padding: const EdgeInsets.symmetric(vertical: 9),
+      child: Row(
+        children: [
+          Icon(
+            selected
+                ? Icons.radio_button_checked
+                : Icons.radio_button_unchecked,
+            size: 26,
+            color: selected ? _lilac : CbColors.textDim,
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Text(
+              label,
+              style: const TextStyle(fontSize: 16, height: 1.25),
+            ),
+          ),
+          if (onHelp != null)
+            InkWell(
+              onTap: onHelp,
+              child: const Padding(
+                padding: EdgeInsets.fromLTRB(14, 8, 8, 8),
+                child: Text(
+                  '?',
+                  style: TextStyle(
+                    color: _lilac,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
-          ]),
-        ),
-      );
+            ),
+        ],
+      ),
+    ),
+  );
 
   Widget _keyRow(RadioController r, KeyAction a, String title) {
     final bound = r.keys.idFor(a) != null;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),
-      child: Row(children: [
-        Expanded(
-          child:
-              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(title, style: const TextStyle(fontSize: 17)),
-            Text(r.keys.labelFor(a),
-                style:
-                    const TextStyle(fontSize: 12.5, color: CbColors.textDim)),
-          ]),
-        ),
-        if (bound)
-          IconButton(
-            tooltip: 'Taste entfernen',
-            visualDensity: VisualDensity.compact,
-            icon: const Icon(Icons.close, size: 18, color: CbColors.textDim),
-            onPressed: () => r.unbindKey(a),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: const TextStyle(fontSize: 17)),
+                Text(
+                  r.keys.labelFor(a),
+                  style: const TextStyle(
+                    fontSize: 12.5,
+                    color: CbColors.textDim,
+                  ),
+                ),
+              ],
+            ),
           ),
-        TextButton(
-          onPressed: () => _learn(r, a),
-          child: const Text('Anlernen',
+          if (bound)
+            IconButton(
+              tooltip: 'Taste entfernen',
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.close, size: 18, color: CbColors.textDim),
+              onPressed: () => r.unbindKey(a),
+            ),
+          TextButton(
+            onPressed: () => _learn(r, a),
+            child: const Text(
+              'Anlernen',
               style: TextStyle(
-                  color: _lilac, fontSize: 16, fontWeight: FontWeight.w600)),
-        ),
-      ]),
+                color: _lilac,
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -217,7 +264,9 @@ class _SettingsDialogState extends State<_SettingsDialog> {
           content: Text('Drücke jetzt die Taste für „${a.label}“ …'),
           actions: [
             TextButton(
-                onPressed: r.keys.cancelLearn, child: const Text('Abbrechen')),
+              onPressed: r.keys.cancelLearn,
+              child: const Text('Abbrechen'),
+            ),
           ],
         );
       },
@@ -259,66 +308,75 @@ class _SettingsDialogState extends State<_SettingsDialog> {
   }
 
   void _showHelp(GatewayMode m) => showDialog<void>(
-        context: context,
-        builder: (c) => AlertDialog(
-          title: Text(m.label, style: const TextStyle(fontSize: 18)),
-          content: Text(_helpText(m)),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(c), child: const Text('OK'))
-          ],
-        ),
-      );
+    context: context,
+    builder: (c) => AlertDialog(
+      title: Text(m.label, style: const TextStyle(fontSize: 18)),
+      content: Text(_helpText(m)),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(c), child: const Text('OK')),
+      ],
+    ),
+  );
 
   void _showGuide() => showDialog<void>(
-        context: context,
-        builder: (c) => AlertDialog(
-          title: const Text('Anleitung für Anfänger'),
-          content: SizedBox(
-            height: (MediaQuery.sizeOf(c).height * 0.6)
-                .clamp(0.0, 420.0)
-                .toDouble(),
-            child: const SingleChildScrollView(
-              child: Text(
-                'Mit dem Gateway verbindest du ein echtes CB-Funkgerät mit der App: '
-                'Was auf dem Funk gesprochen wird, hören alle in der App – und umgekehrt.\n\n'
-                '1. Stelle das Funkgerät auf einen erlaubten Kanal '
-                '(11, 29, 34, 39, 40, 41, 61, 71, 80; 41/61/71/80 nur FM).\n'
-                '2. Wähle die Anschlussart, die zu deinem Aufbau passt. '
-                'Mit dem „?“ neben jeder Art bekommst du eine Kurzerklärung.\n'
-                '3. Verbinde Handy/PC und Funkgerät wie gewählt (Kabel, VOX-Box, USB-Soundkarte …).\n'
-                '4. Schalte „Gateway einschalten“ ein.\n'
-                '5. Prüfe mit einem zweiten Gerät, ob die Sprache in beide Richtungen ankommt, '
-                'und stelle Lautstärke und VOX-Empfindlichkeit am Funkgerät nach.\n\n'
-                'Hinweis: Das Senden über ein Funkgerät ist nur mit entsprechender '
-                'Zulassung und nach den geltenden CB-Funk-Regeln erlaubt.',
-                style: TextStyle(height: 1.4),
-              ),
-            ),
+    context: context,
+    builder: (c) => AlertDialog(
+      title: const Text('Anleitung für Anfänger'),
+      content: SizedBox(
+        height: (MediaQuery.sizeOf(c).height * 0.6)
+            .clamp(0.0, 420.0)
+            .toDouble(),
+        child: const SingleChildScrollView(
+          child: Text(
+            'Mit dem Gateway verbindest du ein echtes CB-Funkgerät mit der App: '
+            'Was auf dem Funk gesprochen wird, hören alle in der App – und umgekehrt.\n\n'
+            '1. Stelle das Funkgerät auf einen erlaubten Kanal '
+            '(11, 29, 34, 39, 40, 41, 61, 71, 80; 41/61/71/80 nur FM).\n'
+            '2. Wähle die Anschlussart, die zu deinem Aufbau passt. '
+            'Mit dem „?“ neben jeder Art bekommst du eine Kurzerklärung.\n'
+            '3. Verbinde Handy/PC und Funkgerät wie gewählt (Kabel, VOX-Box, USB-Soundkarte …).\n'
+            '4. Schalte „Gateway einschalten“ ein.\n'
+            '5. Prüfe mit einem zweiten Gerät, ob die Sprache in beide Richtungen ankommt, '
+            'und stelle Lautstärke und VOX-Empfindlichkeit am Funkgerät nach.\n\n'
+            'Hinweis: Das Senden über ein Funkgerät ist nur mit entsprechender '
+            'Zulassung und nach den geltenden CB-Funk-Regeln erlaubt.',
+            style: TextStyle(height: 1.4),
           ),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(c), child: const Text('OK'))
-          ],
         ),
-      );
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(c), child: const Text('OK')),
+      ],
+    ),
+  );
 
   // ---------- Gateway-Feineinstellungen ----------
-  Widget _slider(String title, String valueText, double v, double min,
-          double max, ValueChanged<double> onChanged, VoidCallback onEnd) =>
-      Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
+  Widget _slider(
+    String title,
+    String valueText,
+    double v,
+    double min,
+    double max,
+    ValueChanged<double> onChanged,
+    VoidCallback onEnd,
+  ) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Row(
+        children: [
           Expanded(child: Text(title, style: const TextStyle(fontSize: 15))),
           Text(valueText, style: const TextStyle(color: CbColors.textDim)),
-        ]),
-        Slider(
-          value: v.clamp(min, max).toDouble(),
-          min: min,
-          max: max,
-          onChanged: onChanged,
-          onChangeEnd: (_) => onEnd(),
-        ),
-      ]);
+        ],
+      ),
+      Slider(
+        value: v.clamp(min, max).toDouble(),
+        min: min,
+        max: max,
+        onChanged: onChanged,
+        onChangeEnd: (_) => onEnd(),
+      ),
+    ],
+  );
 
   List<Widget> _gatewayTuning(RadioController r) {
     final mode = r.gatewayMode;
@@ -328,13 +386,15 @@ class _SettingsDialogState extends State<_SettingsDialog> {
 
     return [
       _heading('Gateway-Feineinstellungen'),
-      _small(isVox
-          ? 'VOX-Betrieb: Das Funkgerät (oder die VOX-Box) schaltet selbst auf Senden. '
-              'Die App stellt vor der Sprache einen kurzen Weckton voran.'
-          : usesSerial
-              ? 'Die App schaltet die Sendetaste über die serielle Leitung (RTS oder DTR).'
-              : 'Die App schaltet die Sendetaste über das USB-HID-GPIO (CM108-kompatibel, '
-                  'z. B. Soundkarte mit CM108/CM119 oder AIOC-Kabel).'),
+      _small(
+        isVox
+            ? 'VOX-Betrieb: Das Funkgerät (oder die VOX-Box) schaltet selbst auf Senden. '
+                  'Die App stellt vor der Sprache einen kurzen Weckton voran.'
+            : usesSerial
+            ? 'Die App schaltet die Sendetaste über die serielle Leitung (RTS oder DTR).'
+            : 'Die App schaltet die Sendetaste über das USB-HID-GPIO (CM108-kompatibel, '
+                  'z. B. Soundkarte mit CM108/CM119 oder AIOC-Kabel).',
+      ),
       if (usesSerial) ...[
         _DevicePicker(
           key: const ValueKey('gateway-serial-device'),
@@ -345,13 +405,15 @@ class _SettingsDialogState extends State<_SettingsDialog> {
           onChanged: (k) => r.updateGateway(serialPort: k),
         ),
         _radioRow(
-            label: 'PTT über RTS',
-            selected: !r.gwUseDtr,
-            onTap: () => r.updateGateway(useDtr: false)),
+          label: 'PTT über RTS',
+          selected: !r.gwUseDtr,
+          onTap: () => r.updateGateway(useDtr: false),
+        ),
         _radioRow(
-            label: 'PTT über DTR',
-            selected: r.gwUseDtr,
-            onTap: () => r.updateGateway(useDtr: true)),
+          label: 'PTT über DTR',
+          selected: r.gwUseDtr,
+          onTap: () => r.updateGateway(useDtr: true),
+        ),
       ],
       if (usesHid) ...[
         _DevicePicker(
@@ -362,14 +424,17 @@ class _SettingsDialogState extends State<_SettingsDialog> {
           value: r.gwHidKey,
           onChanged: (k) => r.updateGateway(hidKey: k),
         ),
-        Wrap(spacing: 8, children: [
-          for (var g = 1; g <= 4; g++)
-            ChoiceChip(
-              label: Text('GPIO $g'),
-              selected: r.gwHidGpio == g,
-              onSelected: (_) => r.updateGateway(hidGpio: g),
-            ),
-        ]),
+        Wrap(
+          spacing: 8,
+          children: [
+            for (var g = 1; g <= 4; g++)
+              ChoiceChip(
+                label: Text('GPIO $g'),
+                selected: r.gwHidGpio == g,
+                onSelected: (_) => r.updateGateway(hidGpio: g),
+              ),
+          ],
+        ),
         _small('Die meisten Geräte nutzen GPIO 3.'),
       ],
       _DevicePicker(
@@ -382,9 +447,20 @@ class _SettingsDialogState extends State<_SettingsDialog> {
         value: r.gwInputId,
         onChanged: (k) => r.updateGateway(inputId: k),
       ),
-      _small(
+      if (Platform.isWindows)
+        _DevicePicker(
+          key: const ValueKey('gateway-audio-output'),
+          title: 'Audio-Ausgang (zum Funkgerät)',
+          autoLabel: 'Windows-Standardgerät verwenden',
+          loader: GatewayDevices.listOutputs,
+          value: r.gwOutputId,
+          onChanged: (k) => r.setGatewayOutputDevice(k),
+        ),
+      if (!Platform.isWindows)
+        _small(
           'Audio-Ausgang (zum Funkgerät): das Standard-Wiedergabegerät des Systems. '
-          'Unter Windows dort die USB-Soundkarte als Standard einstellen.'),
+          'Unter Windows dort die USB-Soundkarte als Standard einstellen.',
+        ),
       _slider(
         'VOX-Schwelle (Funk → Netz)',
         '${(r.gwVoxThreshold * 100).round()} %',
@@ -481,258 +557,327 @@ class _SettingsDialogState extends State<_SettingsDialog> {
         constraints: BoxConstraints(maxWidth: 480, maxHeight: dialogMaxHeight),
         child: Padding(
           padding: const EdgeInsets.fromLTRB(24, 22, 24, 10),
-          child: Column(children: [
-            const Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-              Expanded(
-                child: Text('Einstellungen', style: TextStyle(fontSize: 28)),
-              ),
-              Text('v${AppConfig.appVersion}',
-                  style: TextStyle(color: CbColors.textDim, fontSize: 14)),
-            ]),
-            const SizedBox(height: 6),
-            _hint('▲ Nach oben scrollen ▲', _up, () {
-              _scrollTo(0);
-            }),
-            Expanded(
-              child: ListView(
-                controller: _sc,
-                padding: EdgeInsets.zero,
+          child: Column(
+            children: [
+              const Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  // ---- Funkgerät, Kanal und Audio ----
-                  _heading('Kanäle & Rufname'),
-                  _small('CB-Funk-Kanäle 1–80. Kanal 9 ist der Notrufkanal.',
-                      color: CbColors.text),
-                  const SizedBox(height: 4),
-                  TextField(
-                    controller: _callSignController,
-                    textCapitalization: TextCapitalization.characters,
-                    autocorrect: false,
-                    maxLength: 12,
-                    onChanged: r.setCallSign,
-                    decoration: const InputDecoration(
-                      labelText: 'Rufzeichen',
-                      hintText: 'z. B. DO5VH / 13CT5',
-                      counterText: '',
+                  Expanded(
+                    child: Text(
+                      'Einstellungen',
+                      style: TextStyle(fontSize: 28),
                     ),
                   ),
-
-                  _heading('Audio & Schieberegler'),
-                  _slider(
-                    'Sendepegel (Modulation)',
-                    '${(r.txLevel * 100).round()} % · +${(r.txLevel * 14).round()} dB',
-                    r.txLevel,
-                    0,
-                    1,
-                    r.setTxLevel,
-                    r.saveSettings,
+                  Text(
+                    'v${AppConfig.appVersion}',
+                    style: TextStyle(color: CbColors.textDim, fontSize: 14),
                   ),
-                  _small('Standard: 50 % / +7 dB.'),
-                  _slider(
-                    'Mikrofon-Empfindlichkeit',
-                    '×${r.micSensitivity.toStringAsFixed(2)}',
-                    r.micSensitivity,
-                    0.5,
-                    2.0,
-                    r.setMicSensitivity,
-                    r.saveSettings,
-                  ),
-                  _small(
-                      'Bei leiser Stimme oder größerem Mikrofonabstand erhöhen.'),
-                  _slider(
-                    'Lautstärke',
-                    '${(r.volume * 100).round()} %',
-                    r.volume,
-                    0,
-                    1,
-                    r.setVolume,
-                    r.saveSettings,
-                  ),
-
-                  _heading('Roger-Beep'),
-                  for (var mode = 0; mode < _rogerBeepModes.length; mode++)
-                    _radioRow(
-                      label: _rogerBeepModes[mode],
-                      selected: r.beepMode == mode,
-                      onTap: () => r.setBeepMode(mode),
+                ],
+              ),
+              const SizedBox(height: 6),
+              _hint('▲ Nach oben scrollen ▲', _up, () {
+                _scrollTo(0);
+              }),
+              Expanded(
+                child: ListView(
+                  controller: _sc,
+                  padding: EdgeInsets.zero,
+                  children: [
+                    // ---- Funkgerät, Kanal und Audio ----
+                    _heading('Kanäle & Rufname'),
+                    _small(
+                      'CB-Funk-Kanäle 1–80. Kanal 9 ist der Notrufkanal.',
+                      color: CbColors.text,
+                    ),
+                    const SizedBox(height: 4),
+                    TextField(
+                      controller: _callSignController,
+                      textCapitalization: TextCapitalization.characters,
+                      autocorrect: false,
+                      maxLength: 12,
+                      onChanged: r.setCallSign,
+                      decoration: const InputDecoration(
+                        labelText: 'Rufzeichen',
+                        hintText: 'z. B. DO5VH / 13CT5',
+                        counterText: '',
+                      ),
                     ),
 
-                  _heading('Zusatzfunktionen'),
-                  _switchRow(
-                    'NB/ANL',
-                    'Störimpulse und Rauschen reduzieren.',
-                    r.noiseBlanker,
-                    (_) => r.toggleNb(),
-                  ),
-                  _switchRow(
-                    'Echo',
-                    'Leichtes Echo auf der eigenen Aussendung.',
-                    r.echo,
-                    (_) => r.toggleEcho(),
-                  ),
-                  _switchRow(
-                    'Papagei-Modus',
-                    'Eigene Aussendung lokal wiedergeben; wird nicht über Funk gesendet.',
-                    r.parrot,
-                    r.setParrot,
-                  ),
-                  _switchRow(
-                    'Realistische Reichweite (~1 km)',
-                    'Standort-Umkreis. Die aktuelle MQTT-Schnittstelle überträgt noch keine Standortdaten; Gegenstellen müssen dies ebenfalls unterstützen.',
-                    r.realisticRange,
-                    r.setRealisticRange,
-                  ),
+                    _heading('Audio & Schieberegler'),
+                    _slider(
+                      'Sendepegel (Modulation)',
+                      '${(r.txLevel * 100).round()} % · +${(r.txLevel * 14).round()} dB',
+                      r.txLevel,
+                      0,
+                      1,
+                      r.setTxLevel,
+                      r.saveSettings,
+                    ),
+                    _small('Standard: 50 % / +7 dB.'),
+                    _slider(
+                      'Mikrofon-Empfindlichkeit',
+                      '×${r.micSensitivity.toStringAsFixed(2)}',
+                      r.micSensitivity,
+                      0.5,
+                      2.0,
+                      r.setMicSensitivity,
+                      r.saveSettings,
+                    ),
+                    _small(
+                      'Bei leiser Stimme oder größerem Mikrofonabstand erhöhen.',
+                    ),
+                    _slider(
+                      'Lautstärke',
+                      '${(r.volume * 100).round()} %',
+                      r.volume,
+                      0,
+                      1,
+                      r.setVolume,
+                      r.saveSettings,
+                    ),
 
-                  // ---- Gateway ----
-                  const Text('Gateway – echtes CB-Funkgerät',
-                      style:
-                          TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
-                  const SizedBox(height: 10),
-                  _small(
+                    _heading('Roger-Beep'),
+                    for (var mode = 0; mode < _rogerBeepModes.length; mode++)
+                      _radioRow(
+                        label: _rogerBeepModes[mode],
+                        selected: r.beepMode == mode,
+                        onTap: () => r.setBeepMode(mode),
+                      ),
+
+                    _heading('Zusatzfunktionen'),
+                    _switchRow(
+                      'NB/ANL',
+                      'Störimpulse und Rauschen reduzieren.',
+                      r.noiseBlanker,
+                      (_) => r.toggleNb(),
+                    ),
+                    _switchRow(
+                      'Echo',
+                      'Leichtes Echo auf der eigenen Aussendung.',
+                      r.echo,
+                      (_) => r.toggleEcho(),
+                    ),
+                    _switchRow(
+                      'Papagei-Modus',
+                      'Eigene Aussendung lokal wiedergeben; wird nicht über Funk gesendet.',
+                      r.parrot,
+                      r.setParrot,
+                    ),
+                    _switchRow(
+                      'Realistische Reichweite (~1 km)',
+                      'Simuliert einen begrenzten Funk-Umkreis. Die Standortfreigabe wird separat eingestellt.',
+                      r.realisticRange,
+                      r.setRealisticRange,
+                    ),
+
+                    if (Platform.isWindows) ...[
+                      _heading('Live-Karte & Standort'),
+                      _switchRow(
+                        'Standort freigeben',
+                        'Überträgt Standort, Rufzeichen und aktiven Kanal in MQTT-Steuerpaketen an den Broker und andere verbundene Stationen.',
+                        r.shareLocation,
+                        r.setShareLocation,
+                      ),
+                      if (r.shareLocation) ...[
+                        _radioRow(
+                          label: 'Ungefährer Standort (ca. 1 km)',
+                          selected: !r.preciseLocation,
+                          onTap: () => r.setPreciseLocation(false),
+                        ),
+                        _radioRow(
+                          label: 'Genauer Standort',
+                          selected: r.preciseLocation,
+                          onTap: () => r.setPreciseLocation(true),
+                        ),
+                        _small(r.locationStatus),
+                      ],
+                      _small(
+                        'Ohne Freigabe werden keine Koordinaten übertragen. '
+                        'Die Live-Karte zeigt Stationen mit aktiver Standortfreigabe. '
+                        'Die aktuelle MQTT-Verbindung ist unverschlüsselt.',
+                      ),
+                    ],
+
+                    // ---- Gateway ----
+                    const Text(
+                      'Gateway – echtes CB-Funkgerät',
+                      style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    _small(
                       'Verbindet ein echtes CB-Funkgerät mit der App: Was auf dem Funk '
                       'gesprochen wird, hören alle in der App – und umgekehrt.',
-                      color: CbColors.text),
-                  const SizedBox(height: 6),
-                  OutlinedButton(
-                    onPressed: _showGuide,
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: _lilac,
-                      minimumSize: const Size.fromHeight(50),
-                      side: const BorderSide(color: CbColors.textDim),
-                      shape: const StadiumBorder(),
+                      color: CbColors.text,
                     ),
-                    child: const Text('📖 Anleitungen für Anfänger',
-                        style: TextStyle(fontSize: 16)),
-                  ),
-                  const SizedBox(height: 6),
-                  _switchRow(
-                    'Gateway einschalten',
-                    'Nur Kanal $channels (41/61/71/80 nur FM)',
-                    r.gatewayEnabled,
-                    (v) {
-                      final ok = r.setGatewayEnabled(v);
-                      setState(() => _gwHint = ok
-                          ? null
-                          : 'Auf Kanal ${r.channel} (${r.modulation.label}) ist der '
-                              'Gateway nicht erlaubt. Wähle einen der genannten Kanäle, '
-                              'bei 41/61/71/80 mit FM.');
-                    },
-                  ),
-                  if (_gwHint != null)
-                    _small(_gwHint!, color: CbColors.accentRed),
-                  const SizedBox(height: 8),
-                  const Text('Anschlussart', style: TextStyle(fontSize: 16)),
-                  const SizedBox(height: 4),
-                  for (final m in GatewayMode.values)
-                    _radioRow(
-                      label: m.label,
-                      selected: r.gatewayMode == m,
-                      onTap: () => r.setGatewayMode(m),
-                      onHelp: () => _showHelp(m),
+                    const SizedBox(height: 6),
+                    OutlinedButton(
+                      onPressed: _showGuide,
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: _lilac,
+                        minimumSize: const Size.fromHeight(50),
+                        side: const BorderSide(color: CbColors.textDim),
+                        shape: const StadiumBorder(),
+                      ),
+                      child: const Text(
+                        '📖 Anleitungen für Anfänger',
+                        style: TextStyle(fontSize: 16),
+                      ),
                     ),
+                    const SizedBox(height: 6),
+                    _switchRow(
+                      'Gateway einschalten',
+                      'Nur Kanal $channels (41/61/71/80 nur FM)',
+                      r.gatewayEnabled,
+                      (v) {
+                        final ok = r.setGatewayEnabled(v);
+                        setState(
+                          () => _gwHint = ok
+                              ? null
+                              : 'Auf Kanal ${r.channel} (${r.modulation.label}) ist der '
+                                    'Gateway nicht erlaubt. Wähle einen der genannten Kanäle, '
+                                    'bei 41/61/71/80 mit FM.',
+                        );
+                      },
+                    ),
+                    if (_gwHint != null)
+                      _small(_gwHint!, color: CbColors.accentRed),
+                    const SizedBox(height: 8),
+                    const Text('Anschlussart', style: TextStyle(fontSize: 16)),
+                    const SizedBox(height: 4),
+                    for (final m in GatewayMode.values)
+                      _radioRow(
+                        label: m.label,
+                        selected: r.gatewayMode == m,
+                        onTap: () => r.setGatewayMode(m),
+                        onHelp: () => _showHelp(m),
+                      ),
 
-                  ..._gatewayTuning(r),
+                    ..._gatewayTuning(r),
 
-                  // ---- Sendetaste & Mikrofon ----
-                  _heading('Sendetaste & Mikrofon'),
-                  _keyRow(r, KeyAction.ptt, 'Angelernte Taste'),
-                  _switchRow(
-                    'Umschalten statt Halten',
-                    'Einmal drücken = senden, nochmal = hören. Praktisch für Bluetooth-Knöpfe.',
-                    r.toggleInsteadOfHold,
-                    r.setToggleInsteadOfHold,
-                  ),
-                  _switchRow(
-                    'Headset-/Bluetooth-Taste sendet',
-                    'Taste am Kabel-Headset oder Bluetooth-PTT-Knopf.',
-                    r.headsetButtonPtt,
-                    r.setHeadsetButtonPtt,
-                  ),
-                  _switchRow(
-                    'Leiser-Taste sendet',
-                    'Lautstärke-runter als PTT (nicht bei Funkgeräten mit Lautstärkeknopf).',
-                    r.volumeDownPtt,
-                    r.setVolumeDownPtt,
-                  ),
-                  _switchRow(
-                    'Externes Mikrofon bevorzugen',
-                    'Aktuell: ${r.micLabel}',
-                    r.preferExternalMic,
-                    r.setPreferExternalMic,
-                  ),
-                  _small(
+                    // ---- Sendetaste & Mikrofon ----
+                    _heading('Sendetaste & Mikrofon'),
+                    _keyRow(r, KeyAction.ptt, 'Angelernte Taste'),
+                    _switchRow(
+                      'Umschalten statt Halten',
+                      'Einmal drücken = senden, nochmal = hören. Praktisch für Bluetooth-Knöpfe.',
+                      r.toggleInsteadOfHold,
+                      r.setToggleInsteadOfHold,
+                    ),
+                    _switchRow(
+                      'Headset-/Bluetooth-Taste sendet',
+                      'Taste am Kabel-Headset oder Bluetooth-PTT-Knopf.',
+                      r.headsetButtonPtt,
+                      r.setHeadsetButtonPtt,
+                    ),
+                    _switchRow(
+                      'Leiser-Taste sendet',
+                      'Lautstärke-runter als PTT (nicht bei Funkgeräten mit Lautstärkeknopf).',
+                      r.volumeDownPtt,
+                      r.setVolumeDownPtt,
+                    ),
+                    _switchRow(
+                      'Externes Mikrofon bevorzugen',
+                      'Aktuell: ${r.micLabel}',
+                      r.preferExternalMic,
+                      r.setPreferExternalMic,
+                    ),
+                    _small(
                       'Zello-/PoC-Funkgeräte (Inrico, Runbo, Sonim, …): die automatische '
-                      'Erkennung über das PTT-Signal folgt mit der Android-Anbindung.'),
+                      'Erkennung über das PTT-Signal folgt mit der Android-Anbindung.',
+                    ),
 
-                  // ---- Tasten ----
-                  _heading('Tasten (Funkgeräte ohne Touch)'),
-                  _small(
+                    // ---- Tasten ----
+                    _heading('Tasten (Funkgeräte ohne Touch)'),
+                    _small(
                       'Standard am PC: Pfeil ↑↓ Kanal · Pfeil ←→ Squelch (oder Lautstärke, '
                       'siehe „Regler wechseln“) · Enter Betriebsart · * Suchlauf · # Kanal 9. '
                       'Angelernte Tasten haben Vorrang.',
-                      color: CbColors.text),
-                  const SizedBox(height: 4),
-                  const Text('Eigene Tasten anlernen (P1, P2, Seitentasten …):',
-                      style: TextStyle(fontSize: 16)),
-                  const SizedBox(height: 4),
-                  for (final a in KeyAction.values)
-                    if (a != KeyAction.ptt) _keyRow(r, a, a.label),
+                      color: CbColors.text,
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Eigene Tasten anlernen (P1, P2, Seitentasten …):',
+                      style: TextStyle(fontSize: 16),
+                    ),
+                    const SizedBox(height: 4),
+                    for (final a in KeyAction.values)
+                      if (a != KeyAction.ptt) _keyRow(r, a, a.label),
 
-                  // ---- Antenne ----
-                  _heading('Antenne'),
-                  _small(
+                    // ---- Antenne ----
+                    _heading('Antenne'),
+                    _small(
                       'Wirkt sofort auf den Signalpegel, der über den Server gesendet '
-                      'und von dir empfangen wird.'),
-                  for (final a in Antenna.values)
-                    _radioRow(
-                      label: a.title,
-                      selected: r.antenna == a,
-                      onTap: () => r.setAntenna(a),
+                      'und von dir empfangen wird.',
                     ),
-
-                  if (r.isAndroid) ...[
-                    _heading('System'),
-                    _small(
-                      'Hintergrunddienst: ${!r.systemStatusLoaded ? 'Status wird geprüft' : r.backgroundServiceRunning ? 'Aktiv' : 'Inaktiv'}',
-                      color: r.backgroundServiceRunning
-                          ? CbColors.online
-                          : CbColors.text,
-                    ),
-                    _small(
-                      'Akkuoptimierung: ${!r.systemStatusLoaded ? 'Status wird geprüft' : r.batteryOptimizationIgnored ? 'Für CB-Funk deaktiviert' : 'Aktiv; Android kann Hintergrundaktivität begrenzen'}',
-                      color:
-                          !r.systemStatusLoaded || r.batteryOptimizationIgnored
-                              ? CbColors.textDim
-                              : CbColors.accentRed,
-                    ),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: OutlinedButton.icon(
-                        onPressed: r.openBatteryOptimizationSettings,
-                        icon:
-                            const Icon(Icons.battery_saver_outlined, size: 18),
-                        label: const Text('Akku-Einstellungen öffnen'),
+                    for (final a in Antenna.values)
+                      _radioRow(
+                        label: a.title,
+                        selected: r.antenna == a,
+                        onTap: () => r.setAntenna(a),
                       ),
-                    ),
+
+                    if (r.isAndroid) ...[
+                      _heading('System'),
+                      _small(
+                        'Hintergrunddienst: ${!r.systemStatusLoaded
+                            ? 'Status wird geprüft'
+                            : r.backgroundServiceRunning
+                            ? 'Aktiv'
+                            : 'Inaktiv'}',
+                        color: r.backgroundServiceRunning
+                            ? CbColors.online
+                            : CbColors.text,
+                      ),
+                      _small(
+                        'Akkuoptimierung: ${!r.systemStatusLoaded
+                            ? 'Status wird geprüft'
+                            : r.batteryOptimizationIgnored
+                            ? 'Für CB-Funk deaktiviert'
+                            : 'Aktiv; Android kann Hintergrundaktivität begrenzen'}',
+                        color:
+                            !r.systemStatusLoaded ||
+                                r.batteryOptimizationIgnored
+                            ? CbColors.textDim
+                            : CbColors.accentRed,
+                      ),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: OutlinedButton.icon(
+                          onPressed: r.openBatteryOptimizationSettings,
+                          icon: const Icon(
+                            Icons.battery_saver_outlined,
+                            size: 18,
+                          ),
+                          label: const Text('Akku-Einstellungen öffnen'),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 8),
                   ],
-                  const SizedBox(height: 8),
-                ],
+                ),
               ),
-            ),
-            _hint('▼ Mehr Einstellungen unten ▼', _down, () {
-              if (_sc.hasClients) _scrollTo(_sc.position.maxScrollExtent);
-            }),
-            Align(
-              alignment: Alignment.centerRight,
-              child: TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Fertig',
+              _hint('▼ Mehr Einstellungen unten ▼', _down, () {
+                if (_sc.hasClients) _scrollTo(_sc.position.maxScrollExtent);
+              }),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text(
+                    'Fertig',
                     style: TextStyle(
-                        color: _lilac,
-                        fontSize: 17,
-                        fontWeight: FontWeight.w600)),
+                      color: _lilac,
+                      fontSize: 17,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
               ),
-            ),
-          ]),
+            ],
+          ),
         ),
       ),
     );
@@ -784,47 +929,59 @@ class _DevicePickerState extends State<_DevicePicker> {
     final current = keys.contains(widget.value) ? widget.value : '';
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          Expanded(
-              child: Text(widget.title, style: const TextStyle(fontSize: 15))),
-          IconButton(
-            tooltip: _loading ? 'Geräte werden geladen' : 'Geräteliste laden',
-            visualDensity: VisualDensity.compact,
-            icon: _loading
-                ? const SizedBox.square(
-                    dimension: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.refresh, size: 20, color: CbColors.textDim),
-            onPressed: _loading ? null : _loadDevices,
-          ),
-        ]),
-        DropdownButton<String>(
-          isExpanded: true,
-          value: current,
-          dropdownColor: const Color(0xFF30333A),
-          items: [
-            DropdownMenuItem(value: '', child: Text(widget.autoLabel)),
-            for (final d in devices)
-              DropdownMenuItem(
-                value: d.key,
-                child: Text(d.label, overflow: TextOverflow.ellipsis),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(widget.title, style: const TextStyle(fontSize: 15)),
               ),
-          ],
-          onChanged: (v) => widget.onChanged(v ?? ''),
-        ),
-        if (_devices == null)
-          const Text(
-            'Geräteliste bei Bedarf über ↻ laden.',
-            style: TextStyle(fontSize: 11, color: CbColors.textDim),
-          )
-        else if (!_loading && devices.isEmpty)
-          const Text(
-            'Keine Geräte gefunden.',
-            style: TextStyle(fontSize: 11, color: CbColors.textDim),
+              IconButton(
+                tooltip: _loading
+                    ? 'Geräte werden geladen'
+                    : 'Geräteliste laden',
+                visualDensity: VisualDensity.compact,
+                icon: _loading
+                    ? const SizedBox.square(
+                        dimension: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(
+                        Icons.refresh,
+                        size: 20,
+                        color: CbColors.textDim,
+                      ),
+                onPressed: _loading ? null : _loadDevices,
+              ),
+            ],
           ),
-      ]),
+          DropdownButton<String>(
+            isExpanded: true,
+            value: current,
+            dropdownColor: const Color(0xFF30333A),
+            items: [
+              DropdownMenuItem(value: '', child: Text(widget.autoLabel)),
+              for (final d in devices)
+                DropdownMenuItem(
+                  value: d.key,
+                  child: Text(d.label, overflow: TextOverflow.ellipsis),
+                ),
+            ],
+            onChanged: (v) => widget.onChanged(v ?? ''),
+          ),
+          if (_devices == null)
+            const Text(
+              'Geräteliste bei Bedarf über ↻ laden.',
+              style: TextStyle(fontSize: 11, color: CbColors.textDim),
+            )
+          else if (!_loading && devices.isEmpty)
+            const Text(
+              'Keine Geräte gefunden.',
+              style: TextStyle(fontSize: 11, color: CbColors.textDim),
+            ),
+        ],
+      ),
     );
   }
 }

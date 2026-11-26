@@ -63,6 +63,13 @@ Empfehlungen:
 
 ## Hinweise
 - Windows: Beim ersten Start Mikrofonzugriff erlauben (Einstellungen > Datenschutz > Mikrofon).
+- Windows: Die Taste „MAP“ öffnet die Live-Karte aller CB-Kanäle. In den Einstellungen
+  lässt sich die Standortfreigabe ausschalten oder auf ungefähr (auf etwa 1 km gerundet)
+  bzw. genau stellen. Ohne Freigabe werden keine Koordinaten übertragen; mit Freigabe
+  gehen Standort, Rufzeichen und aktiver Kanal über MQTT an Broker und verbundene Stationen.
+  Die Karte zeigt kompakte Antennenmarker; Rufzeichen und Kanal erscheinen per Klick oder
+  Mauszeiger. Bei aktivem TX pulsiert der Marker. Zoomtasten ergänzen das Mausrad.
+  Der aktuell konfigurierte MQTT-Zugang (Port 1883) ist unverschlüsselt.
 - Windows-Log: %LOCALAPPDATA%\CB-Funk\cb_funk_debug.log (wird ab 5 MB beim Start nach .old verschoben).
 - Absturz-Abbilder (nur Installer-Version): %LOCALAPPDATA%\CB-Funk\crash\*.dmp
 - Die Visual-C++-Laufzeit liegt im Programmordner, ein vc_redist ist nicht mehr noetig.
@@ -85,3 +92,11 @@ Empfehlungen:
 - Beim Beenden (X, Alt+F4) wird eine laufende Sendung beendet und gespeichert.
 - MQTT: Anzeige "Verbinde ..." waehrend automatischer Neuverbindung.
 - COM-Port-Liste aus der Registry statt alle Ports zu oeffnen (haengt nicht mehr bei Bluetooth-Ports).
+
+## Digitale Betriebsarten (Windows)
+- SSTV ist an Kanal 25 (27,245 MHz) gebunden; Packet Radio an Kanal 24 (27,235 MHz, 1200 Baud AFSK).
+- Beide Fenster bleiben nicht-modal und verschiebbar. Digitalaudio nutzt ohne Sprachfilter den bestehenden MQTT-Audiokanal. Neue Digitalframes verwenden verlustfreies PCM16LE; Frames aelterer Versionen im bisherigen mu-law-Format werden weiter dekodiert. TX-Audio wird nicht lokal mitgehoert und bei aktivem Gateway ueber dessen PTT-Sendepfad geleitet; empfangenes Digitalaudio geht auf den lokalen RX-Lautsprecherpfad.
+- SSTV-Bilder werden ueber einen asynchronen In-App-Browser geladen, vor der Vorschau auf SSTV-Aufloesung skaliert und auf maximal 32 MB Eingabegroesse begrenzt.
+- Es werden keine Server-Topics oder Bildablagen eingerichtet. SSTV-Bilder liegen lokal im App-Datenordner; automatisch bleiben nur die letzten zwei gesendeten/empfangenen Bilder erhalten.
+- Packet-Radio-Nachrichten koennen optional lokal in `packet-radio.log` mitgeschrieben werden.
+- Die digitalen Audio-Paketkennungen (SSTV/Packet) werden von dieser App-Version erkannt; aeltere Versionen ignorieren PCM16LE-Frames.

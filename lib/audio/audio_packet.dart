@@ -3,12 +3,12 @@ import 'dart:typed_data';
 /// Audio-Paket auf Topic cbfunk/ch/<n>/audio
 ///
 /// Byte 0     Version (1)
-/// Byte 1     Modulation (0=FM 1=AM 2=USB 3=LSB)
+/// Byte 1     Modulation (0=FM 1=AM 2=USB 3=LSB 4/6=SSTV 5/7=Packet AFSK)
 /// Byte 2     Antennen-Pegel des Senders in dB (int8)
 /// Byte 3     Kanal (1..80)
 /// Byte 4-7   Sender-ID (uint32)
 /// Byte 8-9   Sequenznummer (uint16)
-/// Byte 10..  mu-law Audio (8 kHz, mono)
+/// Byte 10..  mu-law audio (voice/legacy digital) or PCM16LE (digital v2)
 class AudioPacket {
   AudioPacket({
     required this.sender,
@@ -21,6 +21,53 @@ class AudioPacket {
 
   static const int version = 1;
   static const int headerLen = 10;
+  static const int sstvModulation = 4;
+  static const int packetRadioModulation = 5;
+  static const int sstvLinearPcmModulation = 6;
+  static const int packetRadioLinearPcmModulation = 7;
+
+  static bool isSstvModulation(int modulation) =>
+      modulation == sstvModulation || modulation == sstvLinearPcmModulation;
+
+  static bool isPacketRadioModulation(int modulation) =>
+      modulation == packetRadioModulation ||
+      modulation == packetRadioLinearPcmModulation;
+
+  static bool isDigitalModulation(int modulation) =>
+      isSstvModulation(modulation) || isPacketRadioModulation(modulation);
+
+  static bool isDigitalModulationForChannel(int channel, int modulation) =>
+      (channel == 24 && isPacketRadioModulation(modulation)) ||
+      (channel == 25 && isSstvModulation(modulation));
+
+  static bool isLinearPcmModulation(int modulation) =>
+      modulation == sstvLinearPcmModulation ||
+      modulation == packetRadioLinearPcmModulation;
+
+  static int? digitalModulationForChannel(int channel) => switch (channel) {
+    24 => packetRadioLinearPcmModulation,
+    25 => sstvLinearPcmModulation,
+    _ => null,
+  };
+
+  static Uint8List encodeLinearPcm(Int16List samples) {
+    final payload = Uint8List(samples.lengthInBytes);
+    final data = ByteData.sublistView(payload);
+    for (var i = 0; i < samples.length; i++) {
+      data.setInt16(i * 2, samples[i], Endian.little);
+    }
+    return payload;
+  }
+
+  static Int16List? decodeLinearPcm(Uint8List payload) {
+    if (payload.isEmpty || payload.length.isOdd) return null;
+    final samples = Int16List(payload.length ~/ 2);
+    final data = ByteData.sublistView(payload);
+    for (var i = 0; i < samples.length; i++) {
+      samples[i] = data.getInt16(i * 2, Endian.little);
+    }
+    return samples;
+  }
 
   final int sender;
   final int channel;
