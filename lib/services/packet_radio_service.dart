@@ -139,11 +139,11 @@ class PacketRadioService extends ChangeNotifier {
   }
 
   void _appendSamples(Iterable<int> samples) {
-    _receiveSamples.addAll(samples);
-    const maximumSamples = 8 * 60 * PacketRadioModem.sampleRate;
-    if (_receiveSamples.length > maximumSamples) {
-      _receiveSamples.removeRange(0, _receiveSamples.length - maximumSamples);
-    }
+    // Hoechstens 60 s puffern. Der Rahmenanfang bleibt erhalten; Ueberlauf
+    // wird verworfen statt den Anfang abzuschneiden.
+    const maximumSamples = 60 * PacketRadioModem.sampleRate;
+    final free = maximumSamples - _receiveSamples.length;
+    if (free > 0) _receiveSamples.addAll(samples.take(free));
     _receiveQuietTimer?.cancel();
     _receiveQuietTimer = Timer(
       const Duration(milliseconds: 900),

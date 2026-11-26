@@ -9,6 +9,7 @@ import 'package:flutter/scheduler.dart';
 import '../audio/audio_engine.dart';
 import '../audio/audio_packet.dart';
 import '../audio/mulaw.dart';
+import '../config/app_config.dart';
 import '../state/radio_controller.dart';
 import 'sstv_image_store.dart';
 import 'sstv_modem.dart';
@@ -24,9 +25,18 @@ class SstvService extends ChangeNotifier {
 
   static const int _maximumImageBytes = 32 * 1024 * 1024;
 
+  /// Laengster Empfang (180 s); das laengste Bild (Martin 1) dauert ca. 115 s.
+  static const int _maximumReceiveSamples = 180 * SstvModem.sampleRate;
+
+  /// Bis zu dieser Luecke (10 s) werden verlorene Netzpakete durch Stille
+  /// ersetzt, damit die Zeilen des Bildes an ihrer Position bleiben.
+  static const int _maximumFilledPackets = 500;
+
   final RadioController radio;
   final SstvImageStore store;
   final List<int> _receiveSamples = <int>[];
+  int? _lastSender;
+  int? _lastSequence;
   StreamSubscription<Uint8List>? _audioSubscription;
   StreamSubscription<Map<String, dynamic>>? _controlSubscription;
   StreamSubscription<DigitalPcmFrame>? _gatewaySubscription;
@@ -52,6 +62,14 @@ class SstvService extends ChangeNotifier {
   Object? lastError;
 
   bool get channelReady => radio.channel == 25;
+
+  /// Anzahl verlorener Pakete zwischen zwei Sequenznummern (16 Bit, mit
+  /// Ueberlauf). -1 = doppeltes oder verspaetetes Paket.
+  static int missingPackets(int previousSequence, int sequence) {
+    final missing = (sequence - previousSequence - 1) & 0xffff;
+    return missing >= 0x8000 ? -1 : missing;
+  }
+
   bool get modeLocked => loadingImage || sending || receiving || decoding;
 
   void setActive(bool value) {
@@ -175,7 +193,20 @@ class SstvService extends ChangeNotifier {
     final samples = AudioPacket.isLinearPcmModulation(packet.modulation)
         ? AudioPacket.decodeLinearPcm(packet.payload)
         : Int16List.fromList(packet.payload.map(MuLaw.decode).toList());
-    if (samples != null) _appendSamples(samples);
+    if (samples == null) return;
+    if (!receiving || packet.sender != _lastSender) _lastSequence = null;
+    final previous = _lastSequence;
+    if (previous != null) {
+      final missing = missingPackets(previous, packet.seq);
+      // Doppeltes oder verspaetetes Paket: die Luecke ist schon gefuellt.
+      if (missing < 0) return;
+      if (missing > 0 && missing <= _maximumFilledPackets) {
+        _appendSamples(Int16List(missing * AppConfig.frameSamples));
+      }
+    }
+    _lastSender = packet.sender;
+    _lastSequence = packet.seq;
+    _appendSamples(samples);
   }
 
   void _onGatewayAudio(DigitalPcmFrame frame) {
@@ -195,10 +226,12 @@ class SstvService extends ChangeNotifier {
     }
     receiving = true;
     lastError = null;
-    _receiveSamples.addAll(samples);
-    const maximumSamples = 8 * 180 * SstvModem.sampleRate;
-    if (_receiveSamples.length > maximumSamples) {
-      _receiveSamples.removeRange(0, _receiveSamples.length - maximumSamples);
+    // Der Bildanfang muss am Pufferanfang bleiben: Ueberlauf wird verworfen
+    // statt den Anfang abzuschneiden (das kostete bei grossen Puffern auch
+    // viel Rechenzeit).
+    final free = _maximumReceiveSamples - _receiveSamples.length;
+    if (free > 0) {
+      _receiveSamples.addAll(samples.take(free));
     }
     _receiveQuietTimer?.cancel();
     _receiveQuietTimer = Timer(
@@ -211,13 +244,18 @@ class SstvService extends ChangeNotifier {
 
   void _schedulePartialDecode() {
     if (_isDisposed || _partialDecodeTask != null) return;
+    final linesBefore = _partialLinesDecoded;
     final task = _decodeAvailableLines();
     _partialDecodeTask = task;
     unawaited(
       task.whenComplete(() {
         _partialDecodeTask = null;
+        // Nur bei Fortschritt sofort weitermachen; sonst kaeme bei einer nicht
+        // dekodierbaren Zeile eine Endlosschleife ohne Pause zustande. Neue
+        // Samples stossen die Dekodierung ohnehin erneut an.
         if (!_isDisposed &&
             active &&
+            _partialLinesDecoded > linesBefore &&
             SstvModem.completeLineCount(_receiveSamples.length, selectedMode) >
                 _partialLinesDecoded) {
           _schedulePartialDecode();

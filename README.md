@@ -99,4 +99,6 @@ Empfehlungen:
 - SSTV-Bilder werden ueber einen asynchronen In-App-Browser geladen, vor der Vorschau auf SSTV-Aufloesung skaliert und auf maximal 32 MB Eingabegroesse begrenzt.
 - Es werden keine Server-Topics oder Bildablagen eingerichtet. SSTV-Bilder liegen lokal im App-Datenordner; automatisch bleiben nur die letzten zwei gesendeten/empfangenen Bilder erhalten.
 - Packet-Radio-Nachrichten koennen optional lokal in `packet-radio.log` mitgeschrieben werden.
+- SSTV-Empfang uebers Netz wird exakt nach dem Zeitraster des Senders dekodiert (Martin 1/Scottie 1 pixelgenau, Robot 36 mit halber Farbaufloesung). Gateway-Audio vom Funkgeraet nutzt weiter den toleranten Decoder mit Sync-Suche je Zeile.
+- Gateway auf Kanal 24/25: Signale vom Funkgeraet werden erst ab der VOX-Schwelle (Gateway-Einstellungen) an SSTV/Packet Radio weitergegeben; Stille und Rauschen bleiben draussen. Verlorene Netzpakete werden beim SSTV-Empfang durch Stille ersetzt, das Bild bricht nicht mehr ab.
 - Die digitalen Audio-Paketkennungen (SSTV/Packet) werden von dieser App-Version erkannt; aeltere Versionen ignorieren PCM16LE-Frames.

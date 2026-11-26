@@ -54,7 +54,28 @@ class MqttService extends ChangeNotifier {
   final MapStationRegistry _mapStationRegistry = MapStationRegistry();
   final Map<int, Map<int, DateTime>> _spectrumTalkers = {};
   final Map<int, DateTime> _spectrumRecent = {};
-  String localCallSign = '';
+  String _localCallSign = '';
+
+  String get localCallSign => _localCallSign;
+
+  /// Windows: Das Netzwerk-Isolate sendet die Heartbeats selbst und braucht
+  /// das Rufzeichen, damit andere Stationen es auch ohne PTT sehen. Es wird
+  /// mit dem naechsten Heartbeat (spaetestens 8 s) verschickt, nicht bei
+  /// jedem Tastendruck im Eingabefeld.
+  set localCallSign(String value) {
+    if (value == _localCallSign) return;
+    _localCallSign = value;
+    _sendPresenceToIsolate();
+  }
+
+  void _sendPresenceToIsolate() {
+    if (!_useNetworkIsolate) return;
+    _networkSendPort?.send({
+      'cmd': 'presence',
+      'callsign': _localCallSign.trim().toUpperCase(),
+    });
+  }
+
   double? _locationLatitude;
   double? _locationLongitude;
   bool _locationSharingEnabled = false;
@@ -221,6 +242,7 @@ class MqttService extends ChangeNotifier {
       notifyListeners();
       try {
         await _ensureNetworkIsolate();
+        _sendPresenceToIsolate();
         _networkSendPort?.send({
           'cmd': 'connect',
           'channel': _joined,
@@ -303,6 +325,7 @@ class MqttService extends ChangeNotifier {
 
     if (_useNetworkIsolate) {
       await _ensureNetworkIsolate();
+      _sendPresenceToIsolate();
       _networkSendPort?.send({'cmd': 'reconnect'});
       return;
     }
@@ -813,7 +836,16 @@ void _mqttNetworkWorker(Map<String, Object> args) {
       bool stopping = false;
       bool localTx = false;
       int? channel;
+      // Rufzeichen fuer die Heartbeats dieses Isolates (vom Haupt-Isolate)
+      String callSign = '';
       String topic(int ch, String sub) => '$prefix/ch/$ch/$sub';
+
+      /// Heartbeats tragen das Rufzeichen mit, damit andere Stationen es
+      /// auch ohne PTT sehen (wie unter Android).
+      Map<String, dynamic> withCallSign(Map<String, dynamic> extra) => {
+        if (callSign.isNotEmpty) 'callsign': callSign,
+        ...extra,
+      };
 
       void sendState() => mainPort.send({
         'kind': 'state',
@@ -867,10 +899,10 @@ void _mqttNetworkWorker(Map<String, Object> args) {
         connecting = false;
         sendState();
         subscribeCurrentChannel();
-        sendCtl({'hb': true, 'tx': localTx});
+        sendCtl(withCallSign({'hb': true, 'tx': localTx}));
         heartbeat?.cancel();
         heartbeat = Timer.periodic(const Duration(seconds: 8), (_) {
-          sendCtl({'hb': true, 'tx': localTx});
+          sendCtl(withCallSign({'hb': true, 'tx': localTx}));
         });
       }
 
@@ -1031,7 +1063,7 @@ void _mqttNetworkWorker(Map<String, Object> args) {
                   } catch (_) {}
                 }
                 subscribeCurrentChannel();
-                sendCtl({'hb': true});
+                sendCtl(withCallSign({'hb': true}));
               }
               break;
             case 'scan':
@@ -1052,9 +1084,13 @@ void _mqttNetworkWorker(Map<String, Object> args) {
                     client?.unsubscribe('$prefix/ch/+/audio');
                   } catch (_) {}
                   subscribeCurrentChannel();
-                  sendCtl({'hb': true});
+                  sendCtl(withCallSign({'hb': true}));
                 }
               }
+              break;
+            case 'presence':
+              final next = raw['callsign'];
+              if (next is String) callSign = next.trim().toUpperCase();
               break;
             case 'publishCtl':
               final data = raw['data'];

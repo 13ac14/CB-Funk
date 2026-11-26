@@ -1183,6 +1183,7 @@ class AudioEngine {
     _gwOdd = null;
     _gwPre.clear();
     _voxAbove = 0;
+    _resetDigitalGate();
     if (_voxOpen) _voxClose();
     if (_gwState != 0) {
       _gwKey(false);
@@ -1241,16 +1242,10 @@ class AudioEngine {
         ? AudioPacket.packetRadioModulation
         : null;
     if (digitalMode != null) {
-      onDigitalSamples?.call(
-        DigitalPcmFrame(
-          modulation: digitalMode,
-          samples: Int16List.fromList(
-            f.map((sample) => sample.round()).toList(growable: false),
-          ),
-        ),
-      );
+      _gwDigitalFrame(f, lvl, digitalMode);
       return;
     }
+    if (_digitalGateMode != null) _resetDigitalGate();
     final busy =
         _gwState != 0 ||
         _talker != null ||
@@ -1293,6 +1288,42 @@ class AudioEngine {
       } else if (--_voxHangLeft <= 0) {
         _voxClose();
       }
+    }
+  }
+
+  // ---- Digitaler Gateway-Eingang (Kanal 24/25) ----
+  final DigitalInputGate _digitalGate = DigitalInputGate();
+  int? _digitalGateMode;
+
+  void _resetDigitalGate() {
+    _digitalGate.reset();
+    _digitalGateMode = null;
+  }
+
+  void _gwDigitalFrame(Float64List f, double lvl, int mode) {
+    // Gateway sendet gerade (oder gleich) aufs Funkgeraet: Eingang ignorieren
+    final busy =
+        _gwState != 0 ||
+        _talker != null ||
+        DateTime.now().isBefore(_gwIgnoreUntil);
+    if (busy || _digitalGateMode != mode) _resetDigitalGate();
+    if (busy) return;
+    _digitalGateMode = mode;
+    final frames = _digitalGate.process(
+      f,
+      lvl,
+      threshold: state.gwVoxThreshold,
+      hangFrames: (state.gwHangMs / 20).round(),
+    );
+    for (final frame in frames) {
+      if (frame.isEmpty) continue;
+      final samples = Int16List(frame.length);
+      for (var i = 0; i < frame.length; i++) {
+        samples[i] = frame[i].round().clamp(-32768, 32767).toInt();
+      }
+      onDigitalSamples?.call(
+        DigitalPcmFrame(modulation: mode, samples: samples),
+      );
     }
   }
 
@@ -1918,5 +1949,72 @@ class AudioEngine {
       }
     }
     AppLogger.info('AUDIO', 'AudioEngine erfolgreich beendet');
+  }
+}
+
+/// Pegelschwelle fuer den digitalen Gateway-Eingang (SSTV/Packet, Kanal 24/25).
+///
+/// Wie beim VOX gibt erst ein Signal ueber der Schwelle (zwei Frames in Folge)
+/// den Eingang frei; nach dem Nachlauf schliesst er wieder. Ohne Schwelle
+/// landen Stille und Rauschen dauerhaft im SSTV-/Packet-Puffer: der Empfang
+/// endet nie, und der Bildanfang liegt nicht am Pufferanfang. Das erste Frame
+/// wird ab dem Signalbeginn weitergegeben, weil SSTV den Bildanfang am
+/// Pufferanfang erwartet.
+class DigitalInputGate {
+  bool _open = false;
+  int _above = 0;
+  int _hangLeft = 0;
+  Float64List? _pending;
+
+  bool get isOpen => _open;
+
+  void reset() {
+    _open = false;
+    _above = 0;
+    _hangLeft = 0;
+    _pending = null;
+  }
+
+  /// [level] wie beim VOX: RMS / 32768 / 0,2 (0..1). Liefert die Frames, die
+  /// an SSTV/Packet weitergegeben werden.
+  List<Float64List> process(
+    Float64List frame,
+    double level, {
+    required double threshold,
+    required int hangFrames,
+  }) {
+    if (!_open) {
+      if (level < threshold) {
+        _above = 0;
+        _pending = null;
+        return const <Float64List>[];
+      }
+      if (++_above < 2) {
+        _pending = _trimOnset(frame, threshold);
+        return const <Float64List>[];
+      }
+      _open = true;
+      _hangLeft = hangFrames;
+      final pending = _pending;
+      _pending = null;
+      return <Float64List>[if (pending != null) pending, frame];
+    }
+    if (level >= threshold * 0.7) {
+      _hangLeft = hangFrames;
+    } else if (--_hangLeft <= 0) {
+      // Nachlauf vorbei: dieses Frame gehoert noch dazu, dann zu
+      _open = false;
+      _above = 0;
+    }
+    return <Float64List>[frame];
+  }
+
+  static Float64List _trimOnset(Float64List frame, double threshold) {
+    // Schwelle als Amplitude (RMS-Wert), halbiert als Einsatzpunkt
+    final onset = threshold * 0.2 * 32768.0 * 0.5;
+    for (var i = 0; i < frame.length; i++) {
+      if (frame[i].abs() >= onset) return Float64List.sublistView(frame, i);
+    }
+    return frame;
   }
 }

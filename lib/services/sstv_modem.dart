@@ -57,6 +57,20 @@ class SstvModem {
       final frame = await codec.getNextFrame();
       final image = frame.image;
       try {
+        // Der Codec liefert das Bild bereits in SSTV-Groesse. Erneutes
+        // Zeichnen mit FilterQuality.high wuerde es auch bei 1:1 weichzeichnen.
+        if (image.width == _width && image.height == height) {
+          final data = await image.toByteData(format: ui.ImageByteFormat.png);
+          if (data == null) {
+            throw StateError(
+              'Das verkleinerte Bild konnte nicht kodiert werden',
+            );
+          }
+          return data.buffer.asUint8List(
+            data.offsetInBytes,
+            data.lengthInBytes,
+          );
+        }
         final recorder = ui.PictureRecorder();
         final canvas = ui.Canvas(recorder);
         canvas.drawImageRect(
@@ -167,31 +181,40 @@ class SstvModem {
       final frame = await codec.getNextFrame();
       final image = frame.image;
       try {
-        final recorder = ui.PictureRecorder();
-        final canvas = ui.Canvas(recorder);
-        canvas.drawImageRect(
-          image,
-          ui.Rect.fromLTWH(
-            0,
-            0,
-            image.width.toDouble(),
-            image.height.toDouble(),
-          ),
-          ui.Rect.fromLTWH(0, 0, _width.toDouble(), height.toDouble()),
-          ui.Paint()..filterQuality = ui.FilterQuality.high,
-        );
-        final picture = recorder.endRecording();
-        try {
-          final resized = await picture.toImage(_width, height);
+        // Bereits in SSTV-Groesse: Pixel direkt uebernehmen statt erneut mit
+        // FilterQuality.high (weichzeichnend auch bei 1:1) zu zeichnen.
+        final direct = image.width == _width && image.height == height
+            ? await image.toByteData(format: ui.ImageByteFormat.rawRgba)
+            : null;
+        if (direct != null) {
+          pixels = direct;
+        } else {
+          final recorder = ui.PictureRecorder();
+          final canvas = ui.Canvas(recorder);
+          canvas.drawImageRect(
+            image,
+            ui.Rect.fromLTWH(
+              0,
+              0,
+              image.width.toDouble(),
+              image.height.toDouble(),
+            ),
+            ui.Rect.fromLTWH(0, 0, _width.toDouble(), height.toDouble()),
+            ui.Paint()..filterQuality = ui.FilterQuality.high,
+          );
+          final picture = recorder.endRecording();
           try {
-            pixels = (await resized.toByteData(
-              format: ui.ImageByteFormat.rawRgba,
-            ))!;
+            final resized = await picture.toImage(_width, height);
+            try {
+              pixels = (await resized.toByteData(
+                format: ui.ImageByteFormat.rawRgba,
+              ))!;
+            } finally {
+              resized.dispose();
+            }
           } finally {
-            resized.dispose();
+            picture.dispose();
           }
-        } finally {
-          picture.dispose();
         }
       } finally {
         image.dispose();
@@ -201,6 +224,24 @@ class SstvModem {
     }
 
     final writer = _PcmWriter();
+    _writeHeader(writer, mode);
+    for (final chunk in writer.takeReady()) {
+      yield chunk;
+    }
+
+    for (var y = 0; y < height; y++) {
+      _encodeLine(writer, mode, pixels, y, height);
+      onProgress?.call((y + 1) / height);
+      for (final chunk in writer.takeReady()) {
+        yield chunk;
+      }
+      await Future<void>.delayed(Duration.zero);
+    }
+    final tail = writer.takeRemainder();
+    if (tail.isNotEmpty) yield tail;
+  }
+
+  static void _writeHeader(_PcmWriter writer, SstvMode mode) {
     writer.tone(1900, 0.3);
     writer.tone(1200, 0.01);
     writer.tone(1900, 0.3);
@@ -210,26 +251,23 @@ class SstvModem {
       writer.tone((mode.visCode & (1 << bit)) == 0 ? 1100 : 1300, 0.03);
     }
     writer.tone(1200, 0.03);
-    for (final chunk in writer.takeReady()) {
-      yield chunk;
-    }
+  }
 
-    for (var y = 0; y < height; y++) {
-      if (mode == SstvMode.martin1) {
+  static void _encodeLine(
+    _PcmWriter writer,
+    SstvMode mode,
+    ByteData pixels,
+    int y,
+    int height,
+  ) {
+    switch (mode) {
+      case SstvMode.martin1:
         _encodeMartinLine(writer, pixels, y, height);
-      } else if (mode == SstvMode.scottie1) {
+      case SstvMode.scottie1:
         _encodeScottieLine(writer, pixels, y, height);
-      } else {
+      case SstvMode.robot36:
         _encodeRobotLine(writer, pixels, y, height);
-      }
-      onProgress?.call((y + 1) / height);
-      for (final chunk in writer.takeReady()) {
-        yield chunk;
-      }
-      await Future<void>.delayed(Duration.zero);
     }
-    final tail = writer.takeRemainder();
-    if (tail.isNotEmpty) yield tail;
   }
 
   static void _encodeMartinLine(
@@ -321,11 +359,11 @@ class SstvModem {
     SstvMode mode, {
     bool autoSlant = true,
   }) {
-    return switch (mode) {
-      SstvMode.martin1 => _decodeMartin1(samples, autoSlant),
-      SstvMode.scottie1 => _decodeScottie1(samples, autoSlant),
-      SstvMode.robot36 => _decodeRobot36(samples, autoSlant),
-    };
+    // Netzempfang: exakt nach dem Zeitraster des Senders. Passt das nicht
+    // (z. B. Gateway-Audio vom Funkgeraet mit eigener Taktabweichung), greift
+    // der bisherige, tolerante Decoder mit Sync-Suche je Zeile.
+    return _decodeExact(samples, mode) ??
+        _decodeFrame(samples, mode, autoSlant);
   }
 
   static int completeLineCount(int sampleCount, SstvMode mode) {
@@ -340,6 +378,15 @@ class SstvModem {
         .toInt();
   }
 
+  /// Mindestanteil der Zeilen mit erkanntem Sync, damit ein komplett
+  /// empfangenes Signal als Bild gilt. Einzelne Zeilen ohne Sync (z. B. durch
+  /// ein verlorenes Netzpaket) werden an ihrer Sollposition dekodiert, statt
+  /// das ganze Bild zu verwerfen.
+  static const double _minimumSyncedLineRatio = 0.5;
+
+  /// Dekodiert eine Zeile. false nur, wenn die Zeile ungueltig ist oder noch
+  /// nicht genug Samples vorliegen. Fehlt der Sync, wird die Zeile an ihrer
+  /// Sollposition dekodiert (siehe [_decodeLine]).
   static bool decodeLine(
     List<int> samples,
     SstvMode mode,
@@ -351,6 +398,32 @@ class SstvModem {
     if (line < 0 || line >= height || rgba.length != _width * height * 4) {
       return false;
     }
+    final exact = _decodeLineExact(samples, mode, line, rgba);
+    if (exact != null) return exact;
+    return _decodeLine(samples, mode, line, rgba, autoSlant: autoSlant) != null;
+  }
+
+  /// null = Zeile ungueltig/unvollstaendig, true = mit Sync dekodiert,
+  /// false = ohne Sync an der Sollposition dekodiert.
+  static bool? _decodeLine(
+    List<int> samples,
+    SstvMode mode,
+    int line,
+    Uint8List rgba, {
+    required bool autoSlant,
+  }) {
+    final height = imageHeight(mode);
+    if (line < 0 || line >= height || rgba.length != _width * height * 4) {
+      return null;
+    }
+    var synced = true;
+    int locate(int expected) {
+      if (!autoSlant) return expected;
+      final found = _findSync(samples, expected, 120);
+      if (found >= 0) return found;
+      synced = false;
+      return expected;
+    }
 
     late final Uint8List first;
     late final Uint8List second;
@@ -361,10 +434,9 @@ class SstvModem {
         const porch = 5;
         const componentSamples = 1171;
         final expected = 7520 + line * 3567;
-        final sync = autoSlant ? _findSync(samples, expected, 120) : expected;
-        if (sync < 0 ||
-            sync + syncLength + porch + componentSamples * 3 > samples.length) {
-          return false;
+        final sync = locate(expected);
+        if (sync + syncLength + porch + componentSamples * 3 > samples.length) {
+          return null;
         }
         var cursor = sync + syncLength + porch;
         first = _decodeComponent(samples, cursor, componentSamples / _width);
@@ -379,12 +451,11 @@ class SstvModem {
         const syncLength = 72;
         const porch = 12;
         final expected = 7520 + line * 3414 + componentSamples * 2 + separator;
-        final sync = autoSlant ? _findSync(samples, expected, 120) : expected;
+        final sync = locate(expected);
         final start = sync - componentSamples * 2 - separator;
-        if (sync < 0 ||
-            start < 0 ||
+        if (start < 0 ||
             sync + syncLength + porch + componentSamples > samples.length) {
-          return false;
+          return null;
         }
         first = _decodeComponent(samples, start, componentSamples / _width);
         second = _decodeComponent(
@@ -405,16 +476,15 @@ class SstvModem {
         const separator = 36;
         const chromaSamples = 352;
         final expected = 7520 + line * 1188;
-        final sync = autoSlant ? _findSync(samples, expected, 120) : expected;
-        if (sync < 0 ||
-            sync +
-                    syncLength +
-                    porch +
-                    lumaSamples +
-                    separator +
-                    chromaSamples >
-                samples.length) {
-          return false;
+        final sync = locate(expected);
+        if (sync +
+                syncLength +
+                porch +
+                lumaSamples +
+                separator +
+                chromaSamples >
+            samples.length) {
+          return null;
         }
         final luma = _decodeComponent(
           samples,
@@ -431,7 +501,7 @@ class SstvModem {
         );
         _writeYuvLine(rgba, line, luma, chroma);
     }
-    return true;
+    return synced;
   }
 
   static void _writeRgbLine(
@@ -469,52 +539,384 @@ class SstvModem {
     }
   }
 
-  static SstvDecodedFrame? _decodeMartin1(Int16List samples, bool autoSlant) {
-    final rgba = Uint8List(_width * _martinHeight * 4);
-    for (var y = 0; y < _martinHeight; y++) {
-      if (!decodeLine(
-        samples,
-        SstvMode.martin1,
-        y,
-        rgba,
-        autoSlant: autoSlant,
-      )) {
-        return null;
-      }
+  // ---------------------------------------------------------------------------
+  // Exakter Decoder fuer den Netzempfang
+  //
+  // Ueber MQTT kommen die PCM16-Samples bitgenau an. Der Empfaenger kennt
+  // dasselbe Zeitraster wie der Sender (gleiche Rechnung in _PcmWriter) und
+  // damit Anfang und Laenge jedes Pixeltons. Die Frequenz eines Tons wird nur
+  // aus Samples innerhalb dieses Tons bestimmt: fuer einen phasenstetigen Sinus
+  // gilt x[k-1] + x[k+1] = 2 cos(w) x[k], solange x[k-1] und x[k] zum selben
+  // Ton gehoeren. So gibt es keine Unschaerfe ueber Pixelgrenzen und keinen
+  // Zeilenversatz durch eine ungenaue Sync-Suche.
+  // ---------------------------------------------------------------------------
+
+  /// Erlaubte Abweichung eines Sync-Tons von 1200 Hz.
+  static const double _syncToleranceHz = 60;
+
+  /// Suchbereich, falls der Puffer nicht genau am Bildanfang beginnt (1 s).
+  static const int _maximumExactOffset = sampleRate;
+
+  /// Mindestanteil der Zeilen mit Sync am erwarteten Platz.
+  static const double _minimumExactSyncRatio = 0.6;
+
+  static final Map<SstvMode, _SstvLayout> _layouts = <SstvMode, _SstvLayout>{};
+
+  static _SstvLayout _layoutFor(SstvMode mode) =>
+      _layouts[mode] ??= _buildLayout(mode);
+
+  static _SstvLayout _buildLayout(SstvMode mode) {
+    final height = imageHeight(mode);
+    final pixels = ByteData(_width * height * 4);
+    final writer = _PcmWriter(recordOnly: true);
+    _writeHeader(writer, mode);
+    final headerTones = writer.toneStarts.length;
+    for (var y = 0; y < height; y++) {
+      _encodeLine(writer, mode, pixels, y, height);
     }
-    return SstvDecodedFrame(width: _width, height: _martinHeight, rgba: rgba);
+    final tonesPerLine = (writer.toneStarts.length - headerTones) ~/ height;
+    final layout = _SstvLayout(
+      mode: mode,
+      starts: Int32List.fromList(<int>[...writer.toneStarts, writer.position]),
+      headerTones: headerTones,
+      tonesPerLine: tonesPerLine,
+      height: height,
+    );
+    if (tonesPerLine != layout.expectedTonesPerLine) {
+      throw StateError('Unerwartetes SSTV-Zeitraster fuer ${mode.label}');
+    }
+    return layout;
   }
 
-  static SstvDecodedFrame? _decodeScottie1(Int16List samples, bool autoSlant) {
-    final rgba = Uint8List(_width * _martinHeight * 4);
-    for (var y = 0; y < _martinHeight; y++) {
-      if (!decodeLine(
-        samples,
-        SstvMode.scottie1,
-        y,
-        rgba,
-        autoSlant: autoSlant,
-      )) {
-        return null;
-      }
+  /// Frequenz eines Tons (NaN, wenn nicht messbar, z. B. Stille in einer
+  /// durch Paketverlust gefuellten Luecke).
+  static double _toneFrequency(List<int> samples, int start, int count) {
+    var numerator = 0.0;
+    var energy = 0.0;
+    final first = math.max(start + 1, 1);
+    final last = math.min(start + count - 1, samples.length - 2);
+    for (var k = first; k <= last; k++) {
+      final x = samples[k].toDouble();
+      numerator += x * (samples[k - 1] + samples[k + 1]);
+      energy += x * x;
     }
-    return SstvDecodedFrame(width: _width, height: _martinHeight, rgba: rgba);
+    // Sehr kurzer Ton mit Sample nahe dem Nulldurchgang: das erste Sample
+    // (Uebergang vom vorigen Ton) als Naeherung mitnehmen.
+    if (energy < 20000 && start >= 1 && start <= samples.length - 2) {
+      final x = samples[start].toDouble();
+      numerator += x * (samples[start - 1] + samples[start + 1]);
+      energy += x * x;
+    }
+    if (energy < 20000) return double.nan;
+    final cosine = (numerator / (2 * energy)).clamp(-1.0, 1.0);
+    return math.acos(cosine) * sampleRate / (2 * math.pi);
   }
 
-  static SstvDecodedFrame? _decodeRobot36(Int16List samples, bool autoSlant) {
-    final rgba = Uint8List(_width * _robotHeight * 4);
-    for (var y = 0; y < _robotHeight; y++) {
-      if (!decodeLine(
-        samples,
-        SstvMode.robot36,
-        y,
-        rgba,
-        autoSlant: autoSlant,
-      )) {
-        return null;
+  static double _syncDeviation(
+    List<int> samples,
+    _SstvLayout layout,
+    int line,
+    int offset,
+  ) {
+    final tone = layout.lineTone(line, layout.syncTone);
+    final frequency = _toneFrequency(
+      samples,
+      layout.starts[tone] + offset,
+      layout.toneLength(tone),
+    );
+    return frequency.isNaN ? double.infinity : (frequency - 1200).abs();
+  }
+
+  /// Versatz des Puffers gegenueber dem Zeitraster (0 = Puffer beginnt genau
+  /// am Bildanfang, wie beim Netzempfang). null = kein passendes Raster.
+  static int? _findExactOffset(List<int> samples, _SstvLayout layout) {
+    const probeCount = 12;
+    final probes = <int>[
+      for (var i = 0; i < probeCount; i++)
+        (i * (layout.height - 1)) ~/ (probeCount - 1),
+    ];
+    const required = probeCount - 2;
+
+    (int, double) score(int offset) {
+      var hits = 0;
+      var deviation = 0.0;
+      for (final line in probes) {
+        final d = _syncDeviation(samples, layout, line, offset);
+        if (d <= _syncToleranceHz) {
+          hits++;
+          deviation += d;
+        }
+      }
+      return (hits, deviation);
+    }
+
+    final (zeroHits, zeroDeviation) = score(0);
+    if (zeroHits >= required && zeroDeviation / zeroHits < 5) return 0;
+
+    var bestHits = 0;
+    var bestDeviation = double.infinity;
+    int? bestOffset;
+    for (
+      var offset = -_maximumExactOffset;
+      offset <= _maximumExactOffset;
+      offset++
+    ) {
+      final (hits, deviation) = score(offset);
+      if (hits > bestHits || (hits == bestHits && deviation < bestDeviation)) {
+        bestHits = hits;
+        bestDeviation = deviation;
+        bestOffset = offset;
       }
     }
-    return SstvDecodedFrame(width: _width, height: _robotHeight, rgba: rgba);
+    return bestHits >= required ? bestOffset : null;
+  }
+
+  /// Pixelwerte eines Bildanteils; -1 = nicht messbar.
+  static Int16List _exactComponent(
+    List<int> samples,
+    _SstvLayout layout,
+    int line,
+    int firstTone,
+    int pixelCount,
+    int offset,
+  ) {
+    final values = Int16List(pixelCount);
+    for (var x = 0; x < pixelCount; x++) {
+      final tone = layout.lineTone(line, firstTone + x);
+      final frequency = _toneFrequency(
+        samples,
+        layout.starts[tone] + offset,
+        layout.toneLength(tone),
+      );
+      values[x] = frequency.isNaN
+          ? -1
+          : (((frequency - 1500) / 800) * 255).round().clamp(0, 255).toInt();
+    }
+    return values;
+  }
+
+  /// Nicht messbare Pixel (Luecke durch verlorenes Paket) aus der Zeile
+  /// darueber bzw. dem linken Nachbarn uebernehmen.
+  static void _fillMissing(Int16List values, Int16List? above) {
+    for (var x = 0; x < values.length; x++) {
+      if (values[x] >= 0) continue;
+      final fromAbove = above == null ? -1 : above[x];
+      if (fromAbove >= 0) {
+        values[x] = fromAbove;
+      } else if (x > 0) {
+        values[x] = values[x - 1];
+      }
+    }
+    // Fehlte der Zeilenanfang: vom ersten gueltigen Pixel nach links
+    for (var x = values.length - 2; x >= 0; x--) {
+      if (values[x] < 0) values[x] = values[x + 1];
+    }
+    for (var x = 0; x < values.length; x++) {
+      if (values[x] < 0) values[x] = 0;
+    }
+  }
+
+  static bool _lineComplete(
+    List<int> samples,
+    _SstvLayout layout,
+    int line,
+    int offset,
+  ) {
+    final end = layout.starts[layout.lineTone(line + 1, 0)] + offset;
+    return end <= samples.length;
+  }
+
+  static SstvDecodedFrame? _decodeExact(List<int> samples, SstvMode mode) {
+    final layout = _layoutFor(mode);
+    final offset = _findExactOffset(samples, layout);
+    if (offset == null) return null;
+    final height = layout.height;
+    if (!_lineComplete(samples, layout, height - 1, offset)) return null;
+
+    var syncedLines = 0;
+    for (var line = 0; line < height; line++) {
+      if (_syncDeviation(samples, layout, line, offset) <= _syncToleranceHz) {
+        syncedLines++;
+      }
+    }
+    if (syncedLines < height * _minimumExactSyncRatio) return null;
+
+    final rgba = Uint8List(_width * height * 4);
+    if (mode == SstvMode.robot36) {
+      final luma = <Int16List>[];
+      final chroma = <Int16List>[];
+      for (var line = 0; line < height; line++) {
+        final y = _exactComponent(samples, layout, line, 2, _width, offset);
+        final c = _exactComponent(
+          samples,
+          layout,
+          line,
+          323,
+          _width ~/ 2,
+          offset,
+        );
+        _fillMissing(y, line > 0 ? luma[line - 1] : null);
+        _fillMissing(c, line > 1 ? chroma[line - 2] : null);
+        luma.add(y);
+        chroma.add(c);
+      }
+      for (var line = 0; line < height; line++) {
+        _writeRobotLine(rgba, line, luma[line], chroma);
+      }
+    } else {
+      Int16List? previousRed;
+      Int16List? previousGreen;
+      Int16List? previousBlue;
+      for (var line = 0; line < height; line++) {
+        final (red, green, blue) = _exactRgb(samples, layout, line, offset);
+        _fillMissing(red, previousRed);
+        _fillMissing(green, previousGreen);
+        _fillMissing(blue, previousBlue);
+        _writeRgbValues(rgba, line, red, green, blue);
+        previousRed = red;
+        previousGreen = green;
+        previousBlue = blue;
+      }
+    }
+    return SstvDecodedFrame(width: _width, height: height, rgba: rgba);
+  }
+
+  static (Int16List, Int16List, Int16List) _exactRgb(
+    List<int> samples,
+    _SstvLayout layout,
+    int line,
+    int offset,
+  ) {
+    // Martin 1 und Scottie 1 senden je Zeile Gruen, Blau, Rot
+    final (greenTone, blueTone, redTone) = layout.mode == SstvMode.martin1
+        ? (2, 323, 644)
+        : (0, 321, 643);
+    return (
+      _exactComponent(samples, layout, line, redTone, _width, offset),
+      _exactComponent(samples, layout, line, greenTone, _width, offset),
+      _exactComponent(samples, layout, line, blueTone, _width, offset),
+    );
+  }
+
+  static void _writeRgbValues(
+    Uint8List rgba,
+    int line,
+    Int16List red,
+    Int16List green,
+    Int16List blue,
+  ) {
+    for (var x = 0; x < _width; x++) {
+      final index = (line * _width + x) * 4;
+      rgba[index] = red[x];
+      rgba[index + 1] = green[x];
+      rgba[index + 2] = blue[x];
+      rgba[index + 3] = 255;
+    }
+  }
+
+  /// Robot 36 sendet die Farbanteile abwechselnd: gerade Zeilen U, ungerade
+  /// Zeilen V. Jede Zeile bekommt beide Anteile aus ihrem Zeilenpaar.
+  /// [chroma] enthaelt die Farbzeilen ab Zeile 0 (fehlende = null).
+  static void _writeRobotLine(
+    Uint8List rgba,
+    int line,
+    Int16List luma,
+    List<Int16List?> chroma,
+  ) {
+    Int16List? at(int index) =>
+        index >= 0 && index < chroma.length ? chroma[index] : null;
+    final Int16List? u;
+    final Int16List? v;
+    if (line.isEven) {
+      u = at(line);
+      v = at(line + 1) ?? at(line - 1);
+    } else {
+      u = at(line - 1) ?? at(line + 1);
+      v = at(line);
+    }
+    for (var x = 0; x < _width; x++) {
+      final index = (line * _width + x) * 4;
+      final y = luma[x].toDouble();
+      final cu = (u == null ? 128 : u[x ~/ 2]) - 128.0;
+      final cv = (v == null ? 128 : v[x ~/ 2]) - 128.0;
+      rgba[index] = (y + 1.403 * cv).round().clamp(0, 255);
+      rgba[index + 1] = (y - 0.344 * cu - 0.714 * cv).round().clamp(0, 255);
+      rgba[index + 2] = (y + 1.770 * cu).round().clamp(0, 255);
+      rgba[index + 3] = 255;
+    }
+  }
+
+  /// Live-Vorschau: eine Zeile exakt dekodieren (Puffer beginnt am
+  /// Bildanfang). null = Sync nicht am erwarteten Platz (dann toleranter
+  /// Decoder), false = noch nicht genug Samples.
+  static bool? _decodeLineExact(
+    List<int> samples,
+    SstvMode mode,
+    int line,
+    Uint8List rgba,
+  ) {
+    final layout = _layoutFor(mode);
+    if (!_lineComplete(samples, layout, line, 0)) return false;
+    if (_syncDeviation(samples, layout, line, 0) > _syncToleranceHz) {
+      return null;
+    }
+    if (mode != SstvMode.robot36) {
+      final (red, green, blue) = _exactRgb(samples, layout, line, 0);
+      Int16List? previous(int channel) {
+        if (line == 0) return null;
+        final values = Int16List(_width);
+        for (var x = 0; x < _width; x++) {
+          values[x] = rgba[((line - 1) * _width + x) * 4 + channel];
+        }
+        return values;
+      }
+
+      _fillMissing(red, previous(0));
+      _fillMissing(green, previous(1));
+      _fillMissing(blue, previous(2));
+      _writeRgbValues(rgba, line, red, green, blue);
+      return true;
+    }
+
+    Int16List decoded(int index, int firstTone, int pixelCount) {
+      final values = _exactComponent(
+        samples,
+        layout,
+        index,
+        firstTone,
+        pixelCount,
+        0,
+      );
+      _fillMissing(values, null);
+      return values;
+    }
+
+    final chroma = List<Int16List?>.filled(line + 1, null);
+    chroma[line] = decoded(line, 323, _width ~/ 2);
+    if (line > 0) chroma[line - 1] = decoded(line - 1, 323, _width ~/ 2);
+    _writeRobotLine(rgba, line, decoded(line, 2, _width), chroma);
+    // Die ungerade Zeile vervollstaendigt die Farbe der geraden Zeile davor
+    if (line.isOdd) {
+      _writeRobotLine(rgba, line - 1, decoded(line - 1, 2, _width), chroma);
+    }
+    return true;
+  }
+
+  static SstvDecodedFrame? _decodeFrame(
+    Int16List samples,
+    SstvMode mode,
+    bool autoSlant,
+  ) {
+    final height = imageHeight(mode);
+    final rgba = Uint8List(_width * height * 4);
+    var syncedLines = 0;
+    for (var y = 0; y < height; y++) {
+      final result = _decodeLine(samples, mode, y, rgba, autoSlant: autoSlant);
+      if (result == null) return null;
+      if (result) syncedLines++;
+    }
+    if (syncedLines < height * _minimumSyncedLineRatio) return null;
+    return SstvDecodedFrame(width: _width, height: height, rgba: rgba);
   }
 
   static int _findSync(List<int> samples, int expected, int radius) {
@@ -582,6 +984,14 @@ class SstvModem {
 }
 
 class _PcmWriter {
+  _PcmWriter({this.recordOnly = false});
+
+  /// true: nur das Zeitraster (Beginn jedes Tons) aufzeichnen, keine Samples.
+  /// Dieselbe Rechnung wie beim Senden, damit der Empfaenger jede
+  /// Pixelgrenze exakt kennt.
+  final bool recordOnly;
+  final List<int> toneStarts = <int>[];
+  int position = 0;
   final List<int> _samples = <int>[];
   double _phase = 0;
   double _sampleRemainder = 0;
@@ -591,6 +1001,12 @@ class _PcmWriter {
     final adjusted = exact + 1e-9;
     final count = adjusted.floor();
     _sampleRemainder = adjusted - count;
+    if (recordOnly) {
+      toneStarts.add(position);
+      position += count;
+      return;
+    }
+    position += count;
     final increment = 2 * math.pi * frequency / SstvModem.sampleRate;
     for (var i = 0; i < count; i++) {
       _samples.add((math.sin(_phase) * 11000).round());
@@ -613,4 +1029,38 @@ class _PcmWriter {
     _samples.clear();
     return tail;
   }
+}
+
+/// Zeitraster eines SSTV-Bildes: Beginn jedes Tons in Samples ab Bildanfang.
+class _SstvLayout {
+  _SstvLayout({
+    required this.mode,
+    required this.starts,
+    required this.headerTones,
+    required this.tonesPerLine,
+    required this.height,
+  });
+
+  final SstvMode mode;
+
+  /// Beginn jedes Tons; der letzte Eintrag ist das Ende der Sendung.
+  final Int32List starts;
+  final int headerTones;
+  final int tonesPerLine;
+  final int height;
+
+  /// Martin: Sync, Porch, G, Trenner, B, Trenner, R.
+  /// Scottie: G, Trenner, B, Sync, Porch, R. Robot: Sync, Porch, Y, Trenner, C.
+  int get syncTone => mode == SstvMode.scottie1 ? 641 : 0;
+
+  int get expectedTonesPerLine => switch (mode) {
+    SstvMode.martin1 => 964,
+    SstvMode.scottie1 => 963,
+    SstvMode.robot36 => 483,
+  };
+
+  int lineTone(int line, int index) =>
+      headerTones + line * tonesPerLine + index;
+
+  int toneLength(int tone) => starts[tone + 1] - starts[tone];
 }
