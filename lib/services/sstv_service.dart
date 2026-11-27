@@ -13,6 +13,8 @@ import '../config/app_config.dart';
 import '../state/radio_controller.dart';
 import 'sstv_image_store.dart';
 import 'sstv_modem.dart';
+import 'sstv_overlay.dart';
+import 'app_logger.dart';
 
 class SstvService extends ChangeNotifier {
   SstvService(this.radio, {SstvImageStore? store})
@@ -143,11 +145,12 @@ class SstvService extends ChangeNotifier {
     lastError = null;
     _notify();
     try {
+      final stamped = await _stampCallSignAndTime(image);
       await radio.transmitDigitalAudio(
         mode: AudioPacket.sstvLinearPcmModulation,
         requiredChannel: 25,
         frames: SstvModem.encodeImage(
-          image,
+          stamped,
           selectedMode,
           onProgress: (value) {
             progress = value;
@@ -155,12 +158,32 @@ class SstvService extends ChangeNotifier {
           },
         ),
       );
-      await store.saveImage(image, sent: true);
+      await store.saveImage(stamped, sent: true);
       await refreshRecent();
       status = 'Gesendet · ${selectedMode.label} · Kanal 25';
     } finally {
       sending = false;
       _notify();
+    }
+  }
+
+  /// Rufzeichen und Uhrzeit ins gesendete Bild einblenden. Klappt das nicht,
+  /// wird das Bild ohne Einblendung gesendet statt die Sendung abzubrechen.
+  Future<Uint8List> _stampCallSignAndTime(Uint8List image) async {
+    try {
+      return await SstvOverlay.stamp(
+        image,
+        callSign: radio.callSign,
+        time: DateTime.now(),
+      );
+    } catch (error, stack) {
+      AppLogger.error(
+        'SSTV',
+        'Rufzeichen/Uhrzeit konnten nicht eingeblendet werden',
+        error,
+        stack,
+      );
+      return image;
     }
   }
 

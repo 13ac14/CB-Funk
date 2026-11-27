@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
@@ -7,6 +9,7 @@ import '../services/packet_radio_service.dart';
 import '../services/sstv_modem.dart';
 import '../services/sstv_service.dart';
 import '../state/radio_controller.dart';
+import 'sstv_image_actions.dart';
 import 'sstv_image_picker_dialog.dart';
 
 enum DigitalOverlayMode { sstv, packet }
@@ -252,15 +255,31 @@ class _DigitalRadioOverlayState extends State<DigitalRadioOverlay> {
     final recent = service.recentImages;
     Widget image;
     if (service.receiving && service.liveImage != null) {
-      image = RawImage(
-        image: service.liveImage,
-        fit: BoxFit.contain,
-        filterQuality: FilterQuality.medium,
+      image = SstvImageActions(
+        title: 'SSTV-Empfang (Live-Stand)',
+        loadPng: () => _liveImagePng(service),
+        child: RawImage(
+          image: service.liveImage,
+          fit: BoxFit.contain,
+          filterQuality: FilterQuality.medium,
+        ),
       );
     } else if (loaded != null) {
-      image = Image.memory(loaded, fit: BoxFit.contain, gaplessPlayback: true);
+      final name = service.loadedImageName;
+      image = SstvImageActions(
+        title: name == null ? 'Geladenes Bild' : 'Geladenes Bild · $name',
+        suggestedName: name,
+        loadPng: () async => loaded,
+        child: Image.memory(loaded, fit: BoxFit.contain, gaplessPlayback: true),
+      );
     } else if (recent.isNotEmpty) {
-      image = Image.file(recent.first, fit: BoxFit.contain);
+      final file = recent.first;
+      image = SstvImageActions(
+        title: _recentTitle(file),
+        suggestedName: _fileBaseName(file),
+        loadPng: file.readAsBytes,
+        child: Image.file(file, fit: BoxFit.contain),
+      );
     } else {
       image = const Center(
         child: Text(
@@ -323,15 +342,20 @@ class _DigitalRadioOverlayState extends State<DigitalRadioOverlay> {
                   final file = files[index];
                   return SizedBox(
                     height: 100,
-                    child: Container(
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF100C09),
-                        border: Border.all(color: const Color(0xFF6D482C)),
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(5),
-                        child: Image.file(file, fit: BoxFit.cover),
+                    child: SstvImageActions(
+                      title: _recentTitle(file),
+                      suggestedName: _fileBaseName(file),
+                      loadPng: file.readAsBytes,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF100C09),
+                          border: Border.all(color: const Color(0xFF6D482C)),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(5),
+                          child: Image.file(file, fit: BoxFit.cover),
+                        ),
                       ),
                     ),
                   );
@@ -340,6 +364,41 @@ class _DigitalRadioOverlayState extends State<DigitalRadioOverlay> {
       ),
     ],
   );
+
+  /// Momentaufnahme des Live-Empfangs als PNG.
+  static Future<Uint8List> _liveImagePng(SstvService service) async {
+    final live = service.liveImage?.clone();
+    if (live == null) throw StateError('Kein Live-Bild vorhanden');
+    try {
+      final data = await live.toByteData(format: ui.ImageByteFormat.png);
+      if (data == null) throw StateError('Live-Bild nicht lesbar');
+      return data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+    } finally {
+      live.dispose();
+    }
+  }
+
+  static String _fileBaseName(File file) {
+    final name = file.uri.pathSegments.last;
+    final dot = name.lastIndexOf('.');
+    return dot > 0 ? name.substring(0, dot) : name;
+  }
+
+  /// "Empfangen · 27.11.2026 14:05:12" aus sstv_<UTC-Zeit>_rx.png
+  static String _recentTitle(File file) {
+    final match = RegExp(
+      r'^sstv_(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})(\.\d+)?Z_(tx|rx)',
+    ).firstMatch(file.uri.pathSegments.last);
+    if (match == null) return file.uri.pathSegments.last;
+    final time = DateTime.tryParse(
+      '${match[1]}T${match[2]}:${match[3]}:${match[4]}${match[5] ?? ''}Z',
+    )?.toLocal();
+    final kind = match[6] == 'tx' ? 'Gesendet' : 'Empfangen';
+    if (time == null) return kind;
+    String two(int value) => value.toString().padLeft(2, '0');
+    return '$kind · ${two(time.day)}.${two(time.month)}.${time.year} '
+        '${two(time.hour)}:${two(time.minute)}:${two(time.second)}';
+  }
 
   Widget _packetContent() => AnimatedBuilder(
     animation: widget.packet,
