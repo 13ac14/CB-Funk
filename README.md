@@ -70,6 +70,7 @@ Empfehlungen:
   Die Karte zeigt kompakte Antennenmarker; Rufzeichen und Kanal erscheinen per Klick oder
   Mauszeiger. Bei aktivem TX pulsiert der Marker. Zoomtasten ergänzen das Mausrad.
   Der aktuell konfigurierte MQTT-Zugang (Port 1883) ist unverschlüsselt.
+- Windows: CB-APRS (Opt-in in den Einstellungen unter Live-Karte & Standort). Verbindet sich ueber IPv4 mit cbaprs.dyndns.org:27235, zeigt die APRS-Stationen zusaetzlich auf der Live-Karte und meldet bei Standortfreigabe die eigene Position mit der gewaehlten Genauigkeit (ca. 1 km oder genau) alle 10 Minuten bzw. bei Ortswechsel. Der APRS-Passcode wird aus dem Basis-Rufzeichen berechnet; ohne Rufzeichen nur Empfang. Haken aus: Verbindung sofort getrennt, APRS-Stationen verschwinden von der Karte.
 - Windows-Log: %LOCALAPPDATA%\CB-Funk\cb_funk_debug.log (wird ab 5 MB beim Start nach .old verschoben).
 - Absturz-Abbilder (nur Installer-Version): %LOCALAPPDATA%\CB-Funk\crash\*.dmp
 - Die Visual-C++-Laufzeit liegt im Programmordner, ein vc_redist ist nicht mehr noetig.

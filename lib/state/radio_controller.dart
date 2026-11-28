@@ -17,6 +17,7 @@ import '../gateway/ptt_driver.dart';
 import '../models/enums.dart';
 import '../models/key_action.dart';
 import '../services/app_logger.dart';
+import '../services/aprs/aprs_service.dart';
 import '../services/mqtt_service.dart';
 import 'key_bindings.dart';
 
@@ -170,6 +171,12 @@ class RadioController extends ChangeNotifier
   bool realisticRange = false;
   bool shareLocation = false;
   bool preciseLocation = false;
+
+  /// CB-APRS (Windows): Opt-in in den Standort-Einstellungen
+  bool aprsEnabled = false;
+  late final AprsService aprs = AprsService(
+    softwareVersion: AppConfig.appVersion,
+  )..commentBuilder = _aprsComment;
   String locationStatus = 'Standortfreigabe aus';
   double? _latitude;
   double? _longitude;
@@ -447,10 +454,13 @@ class RadioController extends ChangeNotifier
     parrot = _readPreference<bool>(p, 'parrot', false);
     callSign = _readPreference<String>(p, 'callSign', '').trim().toUpperCase();
     mqtt.localCallSign = callSign;
+    aprs.setCallSign(callSign);
     realisticRange = _readPreference<bool>(p, 'realisticRange', false);
     shareLocation =
         Platform.isWindows && _readPreference<bool>(p, 'shareLocation', false);
     preciseLocation = _readPreference<bool>(p, 'preciseLocation', false);
+    aprsEnabled =
+        Platform.isWindows && _readPreference<bool>(p, 'aprsEnabled', false);
     gwVoxThreshold = _readPreference<double>(
       p,
       'gwVox',
@@ -537,6 +547,7 @@ class RadioController extends ChangeNotifier
       unawaited(_setBackgroundAudio(power));
       if (Platform.isWindows) unawaited(_applyGatewayOutputDevice());
       if (shareLocation) _startLocationUpdates();
+      _applyAprs();
       if (gatewayEnabled) _queueGateway();
     } catch (e, st) {
       AppLogger.error(
@@ -579,6 +590,7 @@ class RadioController extends ChangeNotifier
     'realisticRange': realisticRange,
     if (Platform.isWindows) 'shareLocation': shareLocation,
     if (Platform.isWindows) 'preciseLocation': preciseLocation,
+    if (Platform.isWindows) 'aprsEnabled': aprsEnabled,
     'channel': channel,
     'mod': modulation.index,
     'volume': volume,
@@ -643,6 +655,7 @@ class RadioController extends ChangeNotifier
   void setCallSign(String value) {
     callSign = value.trim().toUpperCase();
     mqtt.localCallSign = callSign;
+    aprs.setCallSign(callSign);
     _saveSoon();
     _changed();
   }
@@ -666,7 +679,7 @@ class RadioController extends ChangeNotifier
       _latitude = null;
       _longitude = null;
       locationStatus = 'Standortfreigabe aus';
-      mqtt.setLocationCoordinates(
+      _shareLocationCoordinates(
         latitude: null,
         longitude: null,
         precise: preciseLocation,
@@ -691,7 +704,7 @@ class RadioController extends ChangeNotifier
 
   void _startLocationUpdates() {
     _locationTimer?.cancel();
-    mqtt.setLocationCoordinates(
+    _shareLocationCoordinates(
       latitude: _latitude,
       longitude: _longitude,
       precise: preciseLocation,
@@ -720,7 +733,7 @@ class RadioController extends ChangeNotifier
         locationStatus = permission == LocationPermission.deniedForever
             ? 'Standortzugriff in den Windows-Einstellungen dauerhaft verweigert'
             : 'Windows-Standortzugriff nicht erteilt';
-        mqtt.setLocationCoordinates(
+        _shareLocationCoordinates(
           latitude: null,
           longitude: null,
           precise: preciseLocation,
@@ -751,7 +764,7 @@ class RadioController extends ChangeNotifier
         'Windows-Standortdienste sind deaktiviert: $e',
       );
       locationStatus = 'Windows-Standortdienste sind deaktiviert';
-      mqtt.setLocationCoordinates(
+      _shareLocationCoordinates(
         latitude: null,
         longitude: null,
         precise: preciseLocation,
@@ -766,7 +779,7 @@ class RadioController extends ChangeNotifier
         st,
       );
       locationStatus = 'Standort konnte nicht ermittelt werden';
-      mqtt.setLocationCoordinates(
+      _shareLocationCoordinates(
         latitude: null,
         longitude: null,
         precise: preciseLocation,
@@ -778,8 +791,52 @@ class RadioController extends ChangeNotifier
     }
   }
 
-  void _publishLocation() {
+  /// Standort an MQTT (Live-Karte) und, falls freigegeben, an APRS geben.
+  /// Fuer MQTT unveraendert; APRS rundet selbst gemaess [precise].
+  void _shareLocationCoordinates({
+    required double? latitude,
+    required double? longitude,
+    required bool precise,
+    required bool enabled,
+  }) {
     mqtt.setLocationCoordinates(
+      latitude: latitude,
+      longitude: longitude,
+      precise: precise,
+      enabled: enabled,
+    );
+    aprs.setPosition(
+      enabled ? latitude : null,
+      enabled ? longitude : null,
+      precise: precise,
+    );
+  }
+
+  /// APRS-Haken in den Standort-Einstellungen (nur Windows)
+  void setAprsEnabled(bool value) {
+    if (!Platform.isWindows || aprsEnabled == value) return;
+    aprsEnabled = value;
+    _save();
+    _applyAprs();
+    _changed();
+  }
+
+  void _applyAprs() {
+    aprs.setCallSign(callSign);
+    aprs.setPosition(
+      shareLocation ? _latitude : null,
+      shareLocation ? _longitude : null,
+      precise: preciseLocation,
+    );
+    aprs.setActive(Platform.isWindows && aprsEnabled && power);
+  }
+
+  String _aprsComment() =>
+      'CB-Funk ${AppConfig.appVersion} Kanal $channel '
+      '${modulation.name.toUpperCase()}';
+
+  void _publishLocation() {
+    _shareLocationCoordinates(
       latitude: _latitude,
       longitude: _longitude,
       precise: preciseLocation,
@@ -908,6 +965,7 @@ class RadioController extends ChangeNotifier
       mqtt.joinChannel(channel);
       unawaited(_setBackgroundAudio(true));
     }
+    _applyAprs();
     _queueGateway();
     _changed();
   }
@@ -1477,6 +1535,7 @@ class RadioController extends ChangeNotifier
     audio.dispose();
     _digitalSamples.close();
     mqtt.removeListener(notifyListeners);
+    aprs.dispose();
     sMeterListenable.dispose();
     AppLogger.close();
     super.dispose();

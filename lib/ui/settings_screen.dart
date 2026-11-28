@@ -161,6 +161,72 @@ class _SettingsDialogState extends State<_SettingsDialog> {
     ),
   );
 
+  /// Opt-in-Haken fuer CB-APRS (Windows) mit Verbindungsstatus.
+  Widget _aprsRow(RadioController r) => Padding(
+    padding: const EdgeInsets.only(top: 6, bottom: 4),
+    child: InkWell(
+      onTap: () => r.setAprsEnabled(!r.aprsEnabled),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Checkbox(
+            value: r.aprsEnabled,
+            onChanged: (value) => r.setAprsEnabled(value ?? false),
+          ),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: ListenableBuilder(
+                listenable: r.aprs,
+                builder: (context, _) {
+                  final call = r.aprs.aprsCallSign;
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'CB-APRS einbinden (cbaprs.dyndns.org)',
+                        style: TextStyle(fontSize: 17),
+                      ),
+                      const Padding(
+                        padding: EdgeInsets.only(top: 3),
+                        child: Text(
+                          'Zeigt APRS-Stationen zusätzlich auf der Live-Karte. '
+                          'Bei Standortfreigabe wird die eigene Position mit der '
+                          'oben gewählten Genauigkeit an den APRS-Server gemeldet. '
+                          'Der Passcode wird aus dem Rufzeichen berechnet.',
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            color: CbColors.textDim,
+                            height: 1.3,
+                          ),
+                        ),
+                      ),
+                      if (r.aprsEnabled)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            '${call == null ? 'Kein Rufzeichen – nur Empfang' : 'APRS-Rufzeichen: $call'}'
+                            ' · ${r.aprs.status}'
+                            '${r.shareLocation ? '' : ' · eigene Position wird nicht gesendet (Standortfreigabe aus)'}',
+                            style: const TextStyle(
+                              fontSize: 12.5,
+                              color: CbColors.text,
+                              height: 1.3,
+                            ),
+                          ),
+                        ),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+
   Widget _radioRow({
     required String label,
     required bool selected,
@@ -691,6 +757,7 @@ class _SettingsDialogState extends State<_SettingsDialog> {
                         ),
                         _small(r.locationStatus),
                       ],
+                      _aprsRow(r),
                       _small(
                         'Ohne Freigabe werden keine Koordinaten übertragen. '
                         'Die Live-Karte zeigt Stationen mit aktiver Standortfreigabe. '

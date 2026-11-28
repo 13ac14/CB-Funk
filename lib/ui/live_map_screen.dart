@@ -3,6 +3,8 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:provider/provider.dart';
 
+import '../services/aprs/aprs_codec.dart';
+import '../services/aprs/aprs_service.dart';
 import '../services/map_station_registry.dart';
 import '../services/mqtt_service.dart';
 import '../state/radio_controller.dart';
@@ -38,7 +40,34 @@ class _LiveMapScreenState extends State<LiveMapScreen>
   @override
   Widget build(BuildContext context) {
     final radio = context.watch<RadioController>();
+    // APRS-Stationen aktualisieren sich gebuendelt ueber den APRS-Dienst
+    return ListenableBuilder(
+      listenable: radio.aprs,
+      builder: (context, _) => _buildMap(context, radio),
+    );
+  }
+
+  /// APRS-Stationen (nur bei Opt-in), ohne Doppel zu Programm-Stationen.
+  List<AprsStation> _aprsStations(
+    RadioController radio,
+    List<MapStation> stations,
+  ) {
+    if (!radio.aprsEnabled) return const <AprsStation>[];
+    final own = <String>{
+      for (final station in stations) ...[
+        station.callSign.toUpperCase(),
+        ?AprsCodec.callSign(station.callSign),
+      ],
+      ?radio.aprs.aprsCallSign,
+    };
+    return radio.aprs.stations
+        .where((station) => !own.contains(station.name))
+        .toList();
+  }
+
+  Widget _buildMap(BuildContext context, RadioController radio) {
     final stations = radio.mqtt.mapStations;
+    final aprsStations = _aprsStations(radio, stations);
     final center = stations.isEmpty
         ? const LatLng(51.1657, 10.4515)
         : LatLng(stations.first.latitude, stations.first.longitude);
@@ -77,7 +106,8 @@ class _LiveMapScreenState extends State<LiveMapScreen>
                     ),
                   ),
                   Text(
-                    '${stations.length} Station${stations.length == 1 ? '' : 'en'}',
+                    '${stations.length} Station${stations.length == 1 ? '' : 'en'}'
+                    '${radio.aprsEnabled ? ' · ${aprsStations.length} APRS' : ''}',
                     style: const TextStyle(
                       color: CbColors.displayBlue,
                       fontWeight: FontWeight.w700,
@@ -118,6 +148,14 @@ class _LiveMapScreenState extends State<LiveMapScreen>
                                 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                             userAgentPackageName: 'de.cbfunk.cb_funk',
                           ),
+                          // APRS unter den eigenen Programm-Stationen
+                          if (aprsStations.isNotEmpty)
+                            MarkerLayer(
+                              markers: [
+                                for (final station in aprsStations)
+                                  _aprsMarker(station),
+                              ],
+                            ),
                           MarkerLayer(
                             markers: [
                               for (final station in stations)
@@ -133,7 +171,7 @@ class _LiveMapScreenState extends State<LiveMapScreen>
                           ),
                         ],
                       ),
-                      if (stations.isEmpty)
+                      if (stations.isEmpty && aprsStations.isEmpty)
                         Align(
                           alignment: Alignment.topCenter,
                           child: Container(
@@ -222,6 +260,86 @@ class _LiveMapScreenState extends State<LiveMapScreen>
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  Marker _aprsMarker(AprsStation station) {
+    final key = 'aprs:${station.name}';
+    final showInfo = _selectedStation == key || _hoveredStation == key;
+    return Marker(
+      key: ValueKey(key),
+      point: LatLng(station.latitude, station.longitude),
+      width: 200,
+      height: showInfo ? 96 : 28,
+      alignment: Alignment.bottomCenter,
+      child: Align(
+        alignment: Alignment.bottomCenter,
+        child: MouseRegion(
+          onEnter: (_) => setState(() => _hoveredStation = key),
+          onExit: (_) {
+            if (_hoveredStation == key) {
+              setState(() => _hoveredStation = null);
+            }
+          },
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => setState(
+              () => _selectedStation = _selectedStation == key ? null : key,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (showInfo) _aprsInfo(station),
+                if (showInfo) const SizedBox(height: 4),
+                _AprsDot(symbolCode: station.symbolCode),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _aprsInfo(AprsStation station) {
+    final minutes = DateTime.now().difference(station.lastHeard).inMinutes;
+    final age = minutes < 1 ? 'gerade eben' : 'vor $minutes min';
+    final comment = station.comment.length > 60
+        ? '${station.comment.substring(0, 60)}…'
+        : station.comment;
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 196),
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration: BoxDecoration(
+        color: const Color(0xE8172028),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: _AprsDot.color, width: 1.2),
+        boxShadow: const [
+          BoxShadow(color: Colors.black45, blurRadius: 5, offset: Offset(0, 2)),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '${station.name} · APRS · $age',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 12,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          if (comment.isNotEmpty)
+            Text(
+              comment,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: CbColors.textDim, fontSize: 10.5),
+            ),
+        ],
       ),
     );
   }
@@ -341,5 +459,41 @@ class _AntennaMarkerState extends State<_AntennaMarker>
         );
       },
     ),
+  );
+}
+
+/// Kleiner Marker fuer APRS-Stationen (Symbol grob nach APRS-Symbolcode).
+class _AprsDot extends StatelessWidget {
+  const _AprsDot({required this.symbolCode});
+
+  static const Color color = Color(0xFFFFB74D);
+
+  final String symbolCode;
+
+  IconData get _icon => switch (symbolCode) {
+    '>' || 'k' || 'u' || 'v' || 'j' || 'U' => Icons.directions_car,
+    'X' || '^' || "'" || 'O' => Icons.flight,
+    '_' || 'W' => Icons.wb_cloudy_outlined,
+    '-' || 'y' => Icons.home_outlined,
+    '#' || '&' || 'n' || 'r' || 'I' => Icons.settings_input_antenna,
+    '[' => Icons.directions_walk,
+    'b' => Icons.pedal_bike,
+    's' || 'Y' => Icons.directions_boat,
+    _ => Icons.place_outlined,
+  };
+
+  @override
+  Widget build(BuildContext context) => Container(
+    width: 24,
+    height: 24,
+    decoration: BoxDecoration(
+      color: const Color(0xE8172028),
+      shape: BoxShape.circle,
+      border: Border.all(color: color, width: 1.4),
+      boxShadow: const [
+        BoxShadow(color: Colors.black38, blurRadius: 3, offset: Offset(0, 1)),
+      ],
+    ),
+    child: Icon(_icon, color: color, size: 14),
   );
 }

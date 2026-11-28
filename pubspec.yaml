@@ -1,7 +1,7 @@
 name: cb_funk
 description: CB-Funk - CB-Funkgeraet als App (MQTT-VoIP)
 publish_to: "none"
-version: 1.4.12+44
+version: 1.4.13+45
 
 environment:
   sdk: ">=3.11.0 <4.0.0"
