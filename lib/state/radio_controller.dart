@@ -152,7 +152,7 @@ class RadioController extends ChangeNotifier
 
   /// Roger-Beep: 0 = aus, 1..5 = Signalvarianten
   @override
-  int beepMode = 1;
+  int beepMode = 0;
   bool get beep => beepMode != 0;
 
   /// Pfeiltasten links/rechts regeln Lautstaerke (true) oder Squelch (false)
@@ -443,7 +443,7 @@ class RadioController extends ChangeNotifier
     headsetButtonPtt = _readPreference<bool>(p, 'headsetButtonPtt', true);
     volumeDownPtt = _readPreference<bool>(p, 'volumeDownPtt', false);
     preferExternalMic = _readPreference<bool>(p, 'preferExternalMic', true);
-    beepMode = _readPreference<int>(p, 'beepMode', 1).clamp(0, 5);
+    beepMode = _readPreference<int>(p, 'beepMode', 0).clamp(0, 5);
     parrot = _readPreference<bool>(p, 'parrot', false);
     callSign = _readPreference<String>(p, 'callSign', '').trim().toUpperCase();
     mqtt.localCallSign = callSign;

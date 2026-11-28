@@ -13,7 +13,7 @@ class AppConfig {
 
   static const String topicPrefix = 'cbfunk';
   static const String appName = 'CB-Funk';
-  static const String appVersion = '1.4.11';
+  static const String appVersion = '1.4.12';
 
   // ---- Audio ----
   /// Netz-/Wiedergaberate (Sprache, 8 kHz mu-law = 64 kbit/s, klingt "CB-typisch")

@@ -9,6 +9,7 @@ import '../services/packet_radio_service.dart';
 import '../services/sstv_modem.dart';
 import '../services/sstv_service.dart';
 import '../state/radio_controller.dart';
+import 'sstv_camera_dialog.dart';
 import 'sstv_image_actions.dart';
 import 'sstv_image_picker_dialog.dart';
 
@@ -98,6 +99,16 @@ class _DigitalRadioOverlayState extends State<DigitalRadioOverlay> {
     context: context,
     builder: (_) => const SstvImagePickerDialog(),
   );
+
+  /// Foto ueber eine Kamera; zugeschnitten auf das Seitenverhaeltnis des
+  /// gewaehlten SSTV-Modus (320 x 256 bzw. 320 x 240).
+  Future<File?> _showSstvCamera(BuildContext context, SstvMode mode) =>
+      showDialog<File>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) =>
+            SstvCameraDialog(aspect: 320 / SstvModem.imageHeight(mode)),
+      );
 
   Widget _titleBar(bool isSstv) => Container(
     height: 38,
@@ -207,6 +218,17 @@ class _DigitalRadioOverlayState extends State<DigitalRadioOverlay> {
                     : () => _runSstv(
                         () => service.loadImage(
                           () => _showSstvImagePicker(context),
+                        ),
+                      ),
+              ),
+              const SizedBox(width: 7),
+              _smallButton(
+                'KAMERA',
+                onPressed: service.sending || service.loadingImage
+                    ? null
+                    : () => _runSstv(
+                        () => service.loadImage(
+                          () => _showSstvCamera(context, service.selectedMode),
                         ),
                       ),
               ),

@@ -1,7 +1,7 @@
 name: cb_funk
 description: CB-Funk - CB-Funkgeraet als App (MQTT-VoIP)
 publish_to: "none"
-version: 1.4.11+43
+version: 1.4.12+44
 
 environment:
   sdk: ">=3.11.0 <4.0.0"
@@ -23,6 +23,8 @@ dependencies:
   flutter_map: ^8.3.2     # Windows-Live-Karte
   latlong2: ^0.9.1
   geolocator: ^14.0.2     # Windows-Standortfreigabe
+  camera_windows: ^0.3.1
+  camera_platform_interface: ^2.15.1
 dev_dependencies:
   flutter_test:
     sdk: flutter
